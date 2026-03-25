@@ -17,7 +17,7 @@ from mcp.types import Tool
 from rich.box import ROUNDED
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Prompt
+from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from mcp_telegram.daemon import DaemonConfig, run_daemon
@@ -346,23 +346,26 @@ def daemon(
 async def setup() -> None:
     """Interactive setup wizard for daemon mode.
 
-    Configures PostgreSQL database and Telegram credentials.
+    All-in-one setup: database, credentials, login, and optionally start daemon.
     """
     console.print(
         Panel.fit(
             "[bold blue]MCP Telegram Setup Wizard[/bold blue]\n\n"
-            "This wizard will help you configure:\n"
-            "1. PostgreSQL database connection\n"
-            "2. Telegram API credentials\n"
-            "3. First-time authentication\n\n"
-            "[dim]You can also use Docker for automatic setup.[/dim]",
+            "This wizard will:\n"
+            "1. Configure PostgreSQL database (create + migrate)\n"
+            "2. Set Telegram API credentials\n"
+            "3. Authenticate with Telegram\n"
+            "4. Optionally start the daemon\n\n"
+            "[dim]Press Ctrl+C at any time to cancel[/dim]",
             title="⚙️ Setup",
             border_style="blue",
         )
     )
 
+    # ========================================
     # Step 1: Database configuration
-    console.print("\n[bold cyan]Step 1: Database Configuration[/bold cyan]")
+    # ========================================
+    console.print("\n[bold cyan]━━━ Step 1/4: Database Configuration ━━━[/bold cyan]")
     console.print("[dim]Press Enter to use defaults[/dim]\n")
 
     db_host = Prompt.ask("Database host", default="localhost")
@@ -373,18 +376,21 @@ async def setup() -> None:
 
     database_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
 
+    # ========================================
     # Step 2: Telegram credentials
-    console.print("\n[bold cyan]Step 2: Telegram API Credentials[/bold cyan]")
-    console.print(
-        "[dim]Get these from https://my.telegram.org/apps[/dim]\n"
-    )
+    # ========================================
+    console.print("\n[bold cyan]━━━ Step 2/4: Telegram API Credentials ━━━[/bold cyan]")
+    console.print("[dim]Get these from https://my.telegram.org/apps[/dim]\n")
 
     api_id = Prompt.ask("API ID")
     api_hash = Prompt.ask("API Hash", password=True)
 
+    # ========================================
     # Step 3: Create database and run migrations
-    console.print("\n[bold cyan]Step 3: Database Setup[/bold cyan]")
+    # ========================================
+    console.print("\n[bold cyan]━━━ Step 3/4: Database Setup ━━━[/bold cyan]")
 
+    pool = None
     try:
         import asyncpg
         from pathlib import Path
@@ -436,8 +442,6 @@ async def setup() -> None:
                 else:
                     console.print("[bold green]✓[/bold green] Schema already exists")
 
-            await pool.close()
-
         console.print("[bold green]✓[/bold green] Database setup complete")
     except Exception as e:
         console.print(f"[bold red]✗[/bold red] Database setup failed: {e}")
@@ -448,14 +452,122 @@ async def setup() -> None:
         )
         raise typer.Exit(1)
 
-    # Step 4: Create .env file
-    console.print("\n[bold cyan]Step 4: Creating Configuration File[/bold cyan]")
+    # ========================================
+    # Step 4: Telegram Authentication
+    # ========================================
+    console.print("\n[bold cyan]━━━ Step 4/4: Telegram Authentication ━━━[/bold cyan]")
 
+    phone = Prompt.ask(
+        "Phone number",
+        default="",
+    )
+
+    if not phone:
+        console.print("[yellow]Skipping authentication. Run 'mcp-telegram login' later.[/yellow]")
+    else:
+        try:
+            from uuid import uuid4
+            from telethon import TelegramClient
+            from mcp_telegram.session import PostgresSession
+
+            # Get or create account
+            async with pool.acquire() as conn:  # type: ignore
+                row = await conn.fetchrow(
+                    "SELECT id FROM telegram_accounts WHERE is_active = TRUE ORDER BY created_at LIMIT 1"
+                )
+
+                if row:
+                    account_id = row["id"]
+                    console.print("[dim]Using existing account[/dim]")
+                else:
+                    # Create new account
+                    account_id = uuid4()
+                    await conn.execute(
+                        """
+                        INSERT INTO telegram_accounts (id, api_id, api_hash, phone, is_active)
+                        VALUES ($1, $2, $3, $4, TRUE)
+                        """,
+                        account_id,
+                        str(api_id),
+                        api_hash,
+                        phone,
+                    )
+                    console.print("[dim]Created new account[/dim]")
+
+            # Initialize PostgreSQL session
+            session = PostgresSession(pool, account_id)  # type: ignore
+            await session._init_session()
+
+            # Create client with PostgreSQL session
+            client = TelegramClient(
+                session=session,
+                api_id=int(api_id),
+                api_hash=api_hash,
+            )
+
+            with console.status("[bold green]Connecting to Telegram...", spinner="dots"):
+                await client.connect()
+                console.print("[bold green]✓[/bold green] Connected to Telegram")
+
+            def code_callback() -> str:
+                return console.input(
+                    "\n[bold cyan]🔢 Verification Code[/bold cyan]\n"
+                    "[dim]Enter the code sent to your Telegram[/dim]\n"
+                    "> "
+                )
+
+            def password_callback() -> str:
+                return console.input(
+                    "\n[bold cyan]🔐 Two-Factor Authentication[/bold cyan]\n"
+                    "[dim]Enter your 2FA password[/dim]\n"
+                    "> ",
+                    password=True,
+                )
+
+            await client.start(
+                phone=phone,
+                code_callback=code_callback,
+                password=password_callback,
+            )  # type: ignore
+
+            # Save session
+            session.save()
+            await asyncio.sleep(0.5)  # Wait for fire-and-forget save
+
+            # Update account with user info
+            me = await client.get_me()
+            async with pool.acquire() as conn:  # type: ignore
+                await conn.execute(
+                    """
+                    UPDATE telegram_accounts
+                    SET user_id = $1, username = $2, updated_at = NOW()
+                    WHERE id = $3
+                    """,
+                    me.id,
+                    getattr(me, "username", None),
+                    account_id,
+                )
+
+            console.print(f"[bold green]✓[/bold green] Logged in as {me.first_name}")
+
+            await client.disconnect()
+
+        except Exception as e:
+            console.print(f"[bold red]✗[/bold red] Authentication failed: {e}")
+            console.print("[dim]You can retry with 'mcp-telegram login' later[/dim]")
+
+    # Close pool
+    if pool:
+        await pool.close()
+
+    # ========================================
+    # Create .env file
+    # ========================================
     env_content = f"""# MCP Telegram Configuration
 # Generated by setup wizard
 
 # Database
-DATABASE_URL=postgresql://{db_user}:***@{db_host}:{db_port}/{db_name}
+DATABASE_URL={database_url}
 
 # Telegram API (from https://my.telegram.org/apps)
 API_ID={api_id}
@@ -470,27 +582,66 @@ DAEMON_PORT=8765
     with open(env_path, "w") as f:
         f.write(env_content)
 
-    console.print(f"[bold green]✓[/bold green] Created {env_path}")
+    console.print(f"\n[bold green]✓[/bold green] Created {env_path}")
 
-    # Step 5: Instructions
-    console.print(
-        Panel.fit(
-            "[bold green]Setup Complete![/bold green]\n\n"
-            "[cyan]Next steps:[/cyan]\n\n"
-            "1. [bold]First-time authentication[/bold] (one of these options):\n\n"
-            "   [dim]# Option A: Login directly (creates account in database)[/dim]\n"
-            "   [bold]source .env && mcp-telegram login[/bold]\n\n"
-            "   [dim]# Option B: Use Docker[/dim]\n"
-            "   [bold]docker-compose up -d[/bold]\n"
-            "   [bold]docker-compose exec daemon mcp-telegram login[/bold]\n\n"
-            "2. [bold]Start the daemon:[/bold]\n"
-            "   [dim]source .env && mcp-telegram daemon[/dim]\n\n"
-            "3. [bold]Configure MCP clients[/bold] to use daemon mode:\n"
-            '   [dim]"args": ["start", "--daemon"][/dim]\n',
-            title="🎉 Setup Complete",
-            border_style="green",
-        )
+    # ========================================
+    # Ask to start daemon
+    # ========================================
+    start_daemon = Confirm.ask(
+        "\nStart the daemon now?",
+        default=True,
     )
+
+    if start_daemon:
+        console.print("\n[bold green]Starting daemon...[/bold green]")
+        console.print("[dim]Press Ctrl+C to stop[/dim]\n")
+
+        # Set environment variables for daemon
+        os.environ["DATABASE_URL"] = database_url
+        os.environ["API_ID"] = api_id
+        os.environ["API_HASH"] = api_hash
+
+        # Import and run daemon
+        from mcp_telegram.daemon import DaemonConfig, run_daemon
+
+        config = DaemonConfig(
+            database_url=database_url,
+            api_id=int(api_id),
+            api_hash=api_hash,
+            host="0.0.0.0",
+            port=8765,
+        )
+
+        console.print(
+            Panel.fit(
+                f"[bold green]Daemon Running![/bold green]\n\n"
+                f"[dim]Host:[/dim] 0.0.0.0\n"
+                f"[dim]Port:[/dim] 8765\n\n"
+                f"[yellow]In another terminal, run:[/yellow]\n"
+                f"  [bold]mcp-telegram start --daemon[/bold]\n\n"
+                f"[dim]Or configure MCP client:[/dim]\n"
+                f'  [bold]"args": ["start", "--daemon"][/bold]',
+                title="🚀 Daemon Mode",
+                border_style="green",
+            )
+        )
+
+        run_daemon(config)
+    else:
+        # Final instructions
+        console.print(
+            Panel.fit(
+                "[bold green]Setup Complete![/bold green]\n\n"
+                "[cyan]To start the daemon:[/cyan]\n"
+                "  [bold]source .env && mcp-telegram daemon[/bold]\n\n"
+                "[cyan]In other terminals, use:[/cyan]\n"
+                "  [bold]mcp-telegram start --daemon[/bold]\n\n"
+                "[dim]Or configure your MCP client with:[/dim]\n"
+                '  [bold]"args": ["start", "--daemon"][/bold]',
+                title="🎉 Ready!",
+                border_style="green",
+            )
+        )
 
 
 @app.command()
