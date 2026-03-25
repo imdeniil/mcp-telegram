@@ -85,7 +85,15 @@ def version() -> None:
 @app.command()
 @async_command
 async def login() -> None:
-    """Login to Telegram."""
+    """Login to Telegram.
+
+    Supports two modes:
+    - Direct mode (default): Uses SQLite session file
+    - Daemon mode: Uses PostgreSQL when DATABASE_URL is set
+
+    For daemon mode, ensure DATABASE_URL, API_ID, and API_HASH are set
+    in environment or .env file (created by 'mcp-telegram setup').
+    """
     console.print(
         Panel.fit(
             "[bold blue]Welcome to MCP Telegram![/bold blue]\n\n"
@@ -98,24 +106,36 @@ async def login() -> None:
         )
     )
 
+    # Check for daemon mode (PostgreSQL)
+    database_url = os.environ.get("DATABASE_URL")
+    use_postgres = bool(database_url)
+
+    if use_postgres:
+        console.print("\n[dim]Daemon mode: Using PostgreSQL session storage[/dim]")
+
     tg = Telegram()
 
     console.print("\n[yellow]Please enter your credentials:[/yellow]")
 
     try:
-        api_id = console.input(
-            "\n[bold cyan]🔑 API ID[/bold cyan]\n"
-            "[dim]Enter your Telegram API ID (found on my.telegram.org)[/dim]\n"
-            "> ",
-            password=True,
-        )
+        # Get credentials from env or prompt
+        api_id = os.environ.get("API_ID")
+        api_hash = os.environ.get("API_HASH")
 
-        api_hash = console.input(
-            "\n[bold cyan]🔒 API Hash[/bold cyan]\n"
-            "[dim]Enter your Telegram API hash (found on my.telegram.org)[/dim]\n"
-            "> ",
-            password=True,
-        )
+        if not api_id:
+            api_id = console.input(
+                "\n[bold cyan]🔑 API ID[/bold cyan]\n"
+                "[dim]Enter your Telegram API ID (found on my.telegram.org)[/dim]\n"
+                "> "
+            )
+
+        if not api_hash:
+            api_hash = console.input(
+                "\n[bold cyan]🔒 API Hash[/bold cyan]\n"
+                "[dim]Enter your Telegram API hash (found on my.telegram.org)[/dim]\n"
+                "> ",
+                password=True,
+            )
 
         phone = console.input(
             "\n[bold cyan]📱 Phone Number[/bold cyan]\n"
@@ -124,10 +144,57 @@ async def login() -> None:
             "> "
         )
 
-        tg.create_client(api_id=api_id, api_hash=api_hash)
+        # For PostgreSQL mode, we need to setup the session differently
+        if use_postgres:
+            import asyncpg
+            from uuid import uuid4
+            from telethon import TelegramClient
+            from mcp_telegram.session import create_session_pool, PostgresSession
+
+            # Create database pool
+            pool = await create_session_pool(database_url)
+
+            # Get or create account
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT id FROM telegram_accounts WHERE is_active = TRUE ORDER BY created_at LIMIT 1"
+                )
+
+                if row:
+                    account_id = row["id"]
+                    console.print("[dim]Using existing account[/dim]")
+                else:
+                    # Create new account
+                    account_id = uuid4()
+                    await conn.execute(
+                        """
+                        INSERT INTO telegram_accounts (id, api_id, api_hash, phone, is_active)
+                        VALUES ($1, $2, $3, $4, TRUE)
+                        """,
+                        account_id,
+                        str(api_id),
+                        api_hash,
+                        phone,
+                    )
+                    console.print("[dim]Created new account[/dim]")
+
+            # Initialize PostgreSQL session
+            session = PostgresSession(pool, account_id)
+            await session._init_session()
+
+            # Create client with PostgreSQL session
+            client = TelegramClient(
+                session=session,
+                api_id=int(api_id),
+                api_hash=api_hash,
+            )
+        else:
+            # Standard SQLite mode
+            tg.create_client(api_id=api_id, api_hash=api_hash)
+            client = tg.client
 
         with console.status("[bold green]Connecting to Telegram...", spinner="dots"):
-            await tg.client.connect()
+            await client.connect()
             console.print(
                 "\n[bold green]✓[/bold green] [dim]Connected to Telegram[/dim]"
             )
@@ -147,15 +214,34 @@ async def login() -> None:
                 password=True,
             )
 
-        await tg.client.start(
+        await client.start(
             phone=phone,
             code_callback=code_callback,
             password=password_callback,
         )  # type: ignore
 
+        # Save session for PostgreSQL mode
+        if use_postgres:
+            session.save()
+            # Update account with user info
+            me = await client.get_me()
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE telegram_accounts
+                    SET user_id = $1, username = $2, updated_at = NOW()
+                    WHERE id = $3
+                    """,
+                    me.id,
+                    getattr(me, "username", None),
+                    account_id,
+                )
+            # Wait for fire-and-forget save to complete
+            await asyncio.sleep(0.5)
+
         console.print("\n[bold green]✓[/bold green] [dim]Successfully logged in[/dim]")
 
-        user = await tg.client.get_me()
+        user = await client.get_me()
 
         console.print(
             Panel.fit(
@@ -166,6 +252,12 @@ async def login() -> None:
             )
         )
 
+        # Cleanup
+        if client.is_connected():
+            await client.disconnect()
+        if use_postgres:
+            await pool.close()
+
     except ValueError:
         console.print(
             "\n[bold red]✗ Error:[/bold red] API ID must be a number", style="red"
@@ -174,13 +266,6 @@ async def login() -> None:
     except Exception as e:
         console.print(f"\n[bold red]✗ Error:[/bold red] {str(e)}", style="red")
         sys.exit(1)
-    finally:
-        if tg.client.is_connected():
-            # disconnect() is async, but we're in sync context in finally block
-            # Use asyncio.run for cleanup
-            import asyncio
-
-            asyncio.run(tg.client.disconnect())
 
 
 @app.command()
@@ -297,25 +382,67 @@ async def setup() -> None:
     api_id = Prompt.ask("API ID")
     api_hash = Prompt.ask("API Hash", password=True)
 
-    # Step 3: Test database connection
-    console.print("\n[bold cyan]Step 3: Testing Database Connection[/bold cyan]")
+    # Step 3: Create database and run migrations
+    console.print("\n[bold cyan]Step 3: Database Setup[/bold cyan]")
 
     try:
         import asyncpg
+        from pathlib import Path
 
-        with console.status("[bold green]Connecting to database..."):
+        # Connect to postgres (default database) to create our database
+        postgres_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/postgres"
+
+        with console.status("[bold green]Connecting to PostgreSQL..."):
+            conn = await asyncpg.connect(postgres_url)
+
+        # Check if database exists
+        exists = await conn.fetchval(
+            "SELECT 1 FROM pg_database WHERE datname = $1", db_name
+        )
+
+        if not exists:
+            console.print(f"[dim]Creating database '{db_name}'...[/dim]")
+            await conn.execute(f'CREATE DATABASE "{db_name}"')
+            console.print(f"[bold green]✓[/bold green] Database '{db_name}' created")
+        else:
+            console.print(f"[bold green]✓[/bold green] Database '{db_name}' exists")
+
+        await conn.close()
+
+        # Now connect to our database and run migrations
+        with console.status("[bold green]Running migrations..."):
             pool = await asyncpg.create_pool(database_url, min_size=1, max_size=5)
+
+            # Check if schema exists
             async with pool.acquire() as conn:
-                await conn.execute("SELECT 1")
+                version = await conn.fetchval(
+                    "SELECT 1 FROM information_schema.tables WHERE table_name = 'schema_version'"
+                )
+
+                if not version:
+                    # Run migrations
+                    migrations_dir = Path(__file__).parent.parent.parent / "migrations"
+                    if migrations_dir.exists():
+                        for migration_file in sorted(migrations_dir.glob("*.sql")):
+                            console.print(f"[dim]Running {migration_file.name}...[/dim]")
+                            sql = migration_file.read_text()
+                            await conn.execute(sql)
+                        console.print("[bold green]✓[/bold green] Migrations completed")
+                    else:
+                        console.print(
+                            "[yellow]⚠[/yellow] Migrations directory not found. "
+                            "Run manually: psql -d {db_name} -f migrations/001_initial_schema.sql"
+                        )
+                else:
+                    console.print("[bold green]✓[/bold green] Schema already exists")
+
             await pool.close()
 
-        console.print("[bold green]✓[/bold green] Database connection successful")
+        console.print("[bold green]✓[/bold green] Database setup complete")
     except Exception as e:
-        console.print(f"[bold red]✗[/bold red] Database connection failed: {e}")
+        console.print(f"[bold red]✗[/bold red] Database setup failed: {e}")
         console.print(
-            "\n[yellow]Tip:[/yellow] Make sure PostgreSQL is running and the database exists.\n"
-            "You can create it with:\n"
-            f"  [bold]createdb {db_name}[/bold]\n"
+            "\n[yellow]Tip:[/yellow] Make sure PostgreSQL is running.\n"
             "Or use Docker:\n"
             "  [bold]docker-compose up -d postgres[/bold]"
         )
@@ -350,14 +477,16 @@ DAEMON_PORT=8765
         Panel.fit(
             "[bold green]Setup Complete![/bold green]\n\n"
             "[cyan]Next steps:[/cyan]\n\n"
-            "1. [bold]Start the daemon:[/bold]\n"
+            "1. [bold]First-time authentication[/bold] (one of these options):\n\n"
+            "   [dim]# Option A: Login directly (creates account in database)[/dim]\n"
+            "   [bold]source .env && mcp-telegram login[/bold]\n\n"
+            "   [dim]# Option B: Use Docker[/dim]\n"
+            "   [bold]docker-compose up -d[/bold]\n"
+            "   [bold]docker-compose exec daemon mcp-telegram login[/bold]\n\n"
+            "2. [bold]Start the daemon:[/bold]\n"
             "   [dim]source .env && mcp-telegram daemon[/dim]\n\n"
-            "2. [bold]In another terminal, run the MCP server:[/bold]\n"
-            "   [dim]mcp-telegram start --daemon[/dim]\n\n"
-            "3. [bold]Or use Docker Compose:[/bold]\n"
-            "   [dim]docker-compose up -d[/dim]\n\n"
-            "[yellow]Note:[/yellow] On first run, you'll need to login:\n"
-            "   [dim]source .env && mcp-telegram login[/dim]",
+            "3. [bold]Configure MCP clients[/bold] to use daemon mode:\n"
+            '   [dim]"args": ["start", "--daemon"][/dim]\n',
             title="🎉 Setup Complete",
             border_style="green",
         )
