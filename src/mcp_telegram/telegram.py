@@ -380,14 +380,22 @@ class Telegram:
                     return False  # Regular members can't send to broadcast channels
 
                 if permissions.is_banned:
-                    assert isinstance(
-                        permissions.participant,  # type: ignore
+                    if not isinstance(
+                        permissions.participant,
                         types.ChannelParticipantBanned,
-                    )
+                    ):
+                        logger.warning(
+                            f"Unexpected participant type: {type(permissions.participant)}"
+                        )
+                        return False
                     return not permissions.participant.banned_rights.send_messages
 
                 banned_rights = await self.client.get_permissions(entity)
-                assert isinstance(banned_rights, types.ChatBannedRights)
+                if not isinstance(banned_rights, types.ChatBannedRights):
+                    logger.warning(
+                        f"Unexpected banned_rights type: {type(banned_rights)}"
+                    )
+                    return False
 
                 return not banned_rights.send_messages
 

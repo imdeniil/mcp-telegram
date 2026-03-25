@@ -23,3 +23,13 @@ build/
 
 # Misc
 .DS_Store
+
+# Claude Code
+.claude/
+
+# TLDR cache
+.tldr/
+.tldrignore
+
+# Development notes
+thoughts/

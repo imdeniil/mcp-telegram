@@ -1,0 +1,65 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: mcp-telegram-db
+    environment:
+      POSTGRES_USER: ${DB_USER:-mcp}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-mcp_secret}
+      POSTGRES_DB: ${DB_NAME:-mcp_telegram}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-mcp} -d ${DB_NAME:-mcp_telegram}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  daemon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mcp-telegram-daemon
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER:-mcp}:${DB_PASSWORD:-mcp_secret}@postgres:5432/${DB_NAME:-mcp_telegram}
+      - API_ID=${API_ID}
+      - API_HASH=${API_HASH}
+      - DAEMON_HOST=0.0.0.0
+      - DAEMON_PORT=${DAEMON_PORT:-8765}
+    ports:
+      - "${DAEMON_PORT:-8765}:8765"
+    volumes:
+      - telegram_downloads:/app/downloads
+    restart: unless-stopped
+    command: ["mcp-telegram", "daemon"]
+
+  # Optional: Run MCP server in container
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mcp-telegram-mcp
+    depends_on:
+      daemon:
+        condition: service_healthy
+    environment:
+      - DAEMON_URL=http://daemon:8765
+    command: ["mcp-telegram", "start", "--daemon"]
+    profiles:
+      - mcp
+
+volumes:
+  postgres_data:
+  telegram_downloads:
+
+networks:
+  default:
+    name: mcp-telegram-network

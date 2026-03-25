@@ -9,6 +9,7 @@ import sys
 from collections.abc import Callable, Coroutine
 from functools import wraps
 from typing import Any
+from uuid import uuid4
 
 import typer
 
@@ -16,18 +17,21 @@ from mcp.types import Tool
 from rich.box import ROUNDED
 from rich.console import Console
 from rich.panel import Panel
+from rich.prompt import Prompt
 from rich.table import Table
 
+from mcp_telegram.daemon import DaemonConfig, run_daemon
 from mcp_telegram.server import mcp
+from mcp_telegram.server_proxy import run_proxy_server
 from mcp_telegram.telegram import Telegram
 
 logging.basicConfig(
-    level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
 app = typer.Typer(
     name="mcp-telegram",
-    help="MCP Server for Telegram",
+    help="MCP Server for Telegram - with multi-terminal support via daemon mode",
     add_completion=False,
     no_args_is_help=True,
 )
@@ -172,13 +176,192 @@ async def login() -> None:
         sys.exit(1)
     finally:
         if tg.client.is_connected():
-            tg.client.disconnect()
+            # disconnect() is async, but we're in sync context in finally block
+            # Use asyncio.run for cleanup
+            import asyncio
+
+            asyncio.run(tg.client.disconnect())
 
 
 @app.command()
-def start() -> None:
-    """Start the MCP Telegram server."""
-    mcp.run()
+def start(
+    daemon: bool = typer.Option(
+        False, "--daemon", "-d", help="Connect to daemon instead of direct Telegram"
+    ),
+) -> None:
+    """Start the MCP Telegram server.
+
+    By default, connects directly to Telegram (single process mode).
+    Use --daemon to connect to a running daemon (multi-terminal mode).
+    """
+    if daemon:
+        console.print("[dim]Starting MCP server in daemon mode...[/dim]")
+        run_proxy_server()
+    else:
+        console.print("[dim]Starting MCP server in direct mode...[/dim]")
+        mcp.run()
+
+
+@app.command()
+def daemon(
+    host: str = typer.Option("0.0.0.0", "--host", "-h", help="Host to bind to"),
+    port: int = typer.Option(8765, "--port", "-p", help="Port to listen on"),
+) -> None:
+    """Start the Telegram daemon for multi-terminal support.
+
+    The daemon holds a single Telegram connection and exposes an HTTP API.
+    Multiple MCP servers can connect to it simultaneously.
+    """
+    database_url = os.environ.get("DATABASE_URL")
+    api_id = os.environ.get("API_ID")
+    api_hash = os.environ.get("API_HASH")
+    account_id = os.environ.get("ACCOUNT_ID")
+
+    if not database_url:
+        console.print(
+            "[bold red]Error:[/bold red] DATABASE_URL environment variable not set.\n"
+            "Run 'mcp-telegram setup' first or set it manually."
+        )
+        raise typer.Exit(1)
+
+    if not api_id or not api_hash:
+        console.print(
+            "[bold red]Error:[/bold red] API_ID and API_HASH environment variables not set.\n"
+            "Run 'mcp-telegram login' first or set them manually."
+        )
+        raise typer.Exit(1)
+
+    config = DaemonConfig(
+        database_url=database_url,
+        api_id=int(api_id),
+        api_hash=api_hash,
+        account_id=uuid4() if account_id else None,
+        host=host,
+        port=port,
+    )
+
+    console.print(
+        Panel.fit(
+            f"[bold green]Starting Telegram Daemon[/bold green]\n\n"
+            f"[dim]Host:[/dim] {host}\n"
+            f"[dim]Port:[/dim] {port}\n"
+            f"[dim]Database:[/dim] {'***' if database_url else 'Not set'}\n\n"
+            f"[yellow]Multiple terminals can now connect via:[/yellow]\n"
+            f"  [bold]mcp-telegram start --daemon[/bold]",
+            title="🚀 Daemon Mode",
+            border_style="green",
+        )
+    )
+
+    run_daemon(config)
+
+
+@app.command()
+@async_command
+async def setup() -> None:
+    """Interactive setup wizard for daemon mode.
+
+    Configures PostgreSQL database and Telegram credentials.
+    """
+    console.print(
+        Panel.fit(
+            "[bold blue]MCP Telegram Setup Wizard[/bold blue]\n\n"
+            "This wizard will help you configure:\n"
+            "1. PostgreSQL database connection\n"
+            "2. Telegram API credentials\n"
+            "3. First-time authentication\n\n"
+            "[dim]You can also use Docker for automatic setup.[/dim]",
+            title="⚙️ Setup",
+            border_style="blue",
+        )
+    )
+
+    # Step 1: Database configuration
+    console.print("\n[bold cyan]Step 1: Database Configuration[/bold cyan]")
+    console.print("[dim]Press Enter to use defaults[/dim]\n")
+
+    db_host = Prompt.ask("Database host", default="localhost")
+    db_port = Prompt.ask("Database port", default="5432")
+    db_name = Prompt.ask("Database name", default="mcp_telegram")
+    db_user = Prompt.ask("Database user", default="mcp")
+    db_password = Prompt.ask("Database password", password=True)
+
+    database_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+
+    # Step 2: Telegram credentials
+    console.print("\n[bold cyan]Step 2: Telegram API Credentials[/bold cyan]")
+    console.print(
+        "[dim]Get these from https://my.telegram.org/apps[/dim]\n"
+    )
+
+    api_id = Prompt.ask("API ID")
+    api_hash = Prompt.ask("API Hash", password=True)
+
+    # Step 3: Test database connection
+    console.print("\n[bold cyan]Step 3: Testing Database Connection[/bold cyan]")
+
+    try:
+        import asyncpg
+
+        with console.status("[bold green]Connecting to database..."):
+            pool = await asyncpg.create_pool(database_url, min_size=1, max_size=5)
+            async with pool.acquire() as conn:
+                await conn.execute("SELECT 1")
+            await pool.close()
+
+        console.print("[bold green]✓[/bold green] Database connection successful")
+    except Exception as e:
+        console.print(f"[bold red]✗[/bold red] Database connection failed: {e}")
+        console.print(
+            "\n[yellow]Tip:[/yellow] Make sure PostgreSQL is running and the database exists.\n"
+            "You can create it with:\n"
+            f"  [bold]createdb {db_name}[/bold]\n"
+            "Or use Docker:\n"
+            "  [bold]docker-compose up -d postgres[/bold]"
+        )
+        raise typer.Exit(1)
+
+    # Step 4: Create .env file
+    console.print("\n[bold cyan]Step 4: Creating Configuration File[/bold cyan]")
+
+    env_content = f"""# MCP Telegram Configuration
+# Generated by setup wizard
+
+# Database
+DATABASE_URL=postgresql://{db_user}:***@{db_host}:{db_port}/{db_name}
+
+# Telegram API (from https://my.telegram.org/apps)
+API_ID={api_id}
+API_HASH={api_hash}
+
+# Daemon settings
+DAEMON_HOST=0.0.0.0
+DAEMON_PORT=8765
+"""
+
+    env_path = ".env"
+    with open(env_path, "w") as f:
+        f.write(env_content)
+
+    console.print(f"[bold green]✓[/bold green] Created {env_path}")
+
+    # Step 5: Instructions
+    console.print(
+        Panel.fit(
+            "[bold green]Setup Complete![/bold green]\n\n"
+            "[cyan]Next steps:[/cyan]\n\n"
+            "1. [bold]Start the daemon:[/bold]\n"
+            "   [dim]source .env && mcp-telegram daemon[/dim]\n\n"
+            "2. [bold]In another terminal, run the MCP server:[/bold]\n"
+            "   [dim]mcp-telegram start --daemon[/dim]\n\n"
+            "3. [bold]Or use Docker Compose:[/bold]\n"
+            "   [dim]docker-compose up -d[/dim]\n\n"
+            "[yellow]Note:[/yellow] On first run, you'll need to login:\n"
+            "   [dim]source .env && mcp-telegram login[/dim]",
+            title="🎉 Setup Complete",
+            border_style="green",
+        )
+    )
 
 
 @app.command()
