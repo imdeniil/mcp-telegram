@@ -342,12 +342,54 @@ def daemon(
 
 
 @app.command()
-@async_command
-async def setup() -> None:
+def setup() -> None:
     """Interactive setup wizard for daemon mode.
 
     All-in-one setup: database, credentials, login, and optionally start daemon.
     """
+    # Run async setup and get config for daemon if needed
+    result = asyncio.run(_async_setup())
+
+    # Start daemon outside of async context if requested
+    if result and result.get("start_daemon"):
+        console.print("\n[bold green]Starting daemon...[/bold green]")
+        console.print("[dim]Press Ctrl+C to stop[/dim]\n")
+
+        # Set environment variables for daemon
+        os.environ["DATABASE_URL"] = result["database_url"]
+        os.environ["API_ID"] = result["api_id"]
+        os.environ["API_HASH"] = result["api_hash"]
+
+        # Import and run daemon
+        from mcp_telegram.daemon import DaemonConfig, run_daemon
+
+        config = DaemonConfig(
+            database_url=result["database_url"],
+            api_id=int(result["api_id"]),
+            api_hash=result["api_hash"],
+            host="0.0.0.0",
+            port=8765,
+        )
+
+        console.print(
+            Panel.fit(
+                f"[bold green]Daemon Running![/bold green]\n\n"
+                f"[dim]Host:[/dim] 0.0.0.0\n"
+                f"[dim]Port:[/dim] 8765\n\n"
+                f"[yellow]In another terminal, run:[/yellow]\n"
+                f"  [bold]mcp-telegram start --daemon[/bold]\n\n"
+                f"[dim]Or configure MCP client:[/dim]\n"
+                f'  [bold]"args": ["start", "--daemon"][/bold]',
+                title="🚀 Daemon Mode",
+                border_style="green",
+            )
+        )
+
+        run_daemon(config)
+
+
+async def _async_setup() -> dict | None:
+    """Async part of setup wizard."""
     console.print(
         Panel.fit(
             "[bold blue]MCP Telegram Setup Wizard[/bold blue]\n\n"

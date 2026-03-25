@@ -192,33 +192,26 @@ docker-compose exec daemon mcp-telegram login
 
 #### Manual Setup (Without Docker)
 
-1. **Setup PostgreSQL**:
+**One command setup:**
 ```bash
-# Create database
-createdb mcp_telegram
-
-# Run migrations
-psql -d mcp_telegram -f migrations/001_initial_schema.sql
-
-# Or use the setup wizard (interactive)
 mcp-telegram setup
 ```
 
-2. **Create `.env` file**:
-```bash
-DATABASE_URL=postgresql://user:password@localhost:5432/mcp_telegram
-API_ID=your_api_id
-API_HASH=your_api_hash
-```
+This wizard will:
+1. Create PostgreSQL database
+2. Run migrations
+3. Create `.env` file
+4. Authenticate with Telegram
+5. Optionally start the daemon
 
-3. **Start the daemon**:
-```bash
-source .env && mcp-telegram daemon
-```
+**Or step-by-step:**
 
-4. **Start MCP servers** (in other terminals):
 ```bash
-mcp-telegram start --daemon
+# 1. Create database (if not exists)
+createdb mcp_telegram
+
+# 2. Run setup wizard
+mcp-telegram setup
 ```
 
 #### Environment Variables
