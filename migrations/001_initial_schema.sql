@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     port INTEGER NOT NULL DEFAULT 443,
     auth_key BYTEA,  -- 256-byte MTProto authentication key (KEEP SECRET!)
     takeout_id BIGINT,  -- For Telegram data export (takeout) sessions
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (account_id, dc_id)
 );
 

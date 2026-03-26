@@ -13,7 +13,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from mcp_telegram.proxy import get_daemon_client
-from mcp_telegram.types import Dialog, DownloadedMedia, Message, Messages
+from mcp_telegram.types import Dialog, DialogType, DownloadedMedia, Message, Messages
 
 
 @asynccontextmanager
@@ -38,48 +38,51 @@ mcp = FastMCP(
 
 
 def _parse_dialogs(data: dict[str, Any]) -> list[Dialog]:
-    """Parse dialogs from daemon response.
-
-    Maps daemon response fields to Dialog model fields:
-    - name -> title
-    """
+    """Parse dialogs from daemon response."""
     dialogs = []
     for d in data.get("dialogs", []):
+        # Map daemon response to Dialog type
+        dialog_type = d.get("type", "user").lower()
+        type_map = {
+            "user": DialogType.USER,
+            "group": DialogType.GROUP,
+            "channel": DialogType.CHANNEL,
+            "bot": DialogType.BOT,
+            "User": DialogType.USER,
+            "Group": DialogType.GROUP,
+            "Channel": DialogType.CHANNEL,
+        }
+
         dialogs.append(
             Dialog(
                 id=d["id"],
-                title=d.get("name") or "",
+                title=d.get("name") or d.get("title") or "Unknown",
                 username=d.get("username"),
-                type=d.get("type"),
-                phone_number=d.get("phone"),
-                unread_messages_count=0,  # Not provided by daemon
-                can_send_message=True,  # Assume true for now
+                phone_number=d.get("phone_number") or d.get("phone"),
+                type=type_map.get(dialog_type, DialogType.USER),
+                unread_messages_count=d.get("unread_messages_count", 0),
+                can_send_message=d.get("can_send_message", True),
             )
         )
     return dialogs
 
 
 def _parse_messages(data: dict[str, Any]) -> Messages:
-    """Parse messages from daemon response.
-
-    Maps daemon response fields to Message model fields:
-    - id -> message_id
-    - text -> message
-    - from_id -> sender_id
-    - out -> outgoing
-    """
+    """Parse messages from daemon response."""
     messages = []
     for m in data.get("messages", []):
         messages.append(
             Message(
                 message_id=m["id"],
-                message=m.get("text"),
-                date=datetime.fromisoformat(m["date"]) if m.get("date") else None,
                 sender_id=m.get("from_id"),
+                message=m.get("text"),
                 outgoing=m.get("out", False),
+                date=datetime.fromisoformat(m["date"]) if m.get("date") else None,
+                media=None,  # Not returned by daemon currently
+                reply_to=m.get("reply_to"),
             )
         )
-    return Messages(messages=messages)
+    return Messages(messages=messages, dialog=None)
 
 
 @mcp.tool()
@@ -226,7 +229,9 @@ async def get_messages(
 
 
 @mcp.tool()
-async def media_download(entity: str, message_id: int, path: str | None = None) -> DownloadedMedia:
+async def media_download(
+    entity: str, message_id: int, path: str | None = None
+) -> DownloadedMedia:
     """Download media from a message.
 
     Args:

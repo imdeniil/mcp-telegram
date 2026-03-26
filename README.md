@@ -22,7 +22,8 @@ Built with [Telethon](https://github.com/LonamiWebs/Telethon), this server allow
   - [Prerequisites](#prerequisites)
   - [Installation](#installation)
 - [⚙️ Usage](#️-usage)
-  - [Login](#login)
+  - [The Setup Wizard (Recommended)](#the-setup-wizard-recommended)
+  - [Manual Login](#login)
   - [Connect to the MCP server](#connect-to-the-mcp-server)
   - [Multi-Terminal Mode (Daemon)](#multi-terminal-mode-daemon)
 - [🧰 Available Tools](#-available-tools)
@@ -44,14 +45,15 @@ Built with [Telethon](https://github.com/LonamiWebs/Telethon), this server allow
 ### Prerequisites
 
 - Python 3.10 or higher
-- [`uv`](https://github.com/astral-sh/uv) Install via the [official uv guide](https://github.com/astral-sh/uv#installation).
+- [`uv`](https://github.com/astral-sh/uv) (Recommended) or `pip`
+- [Docker & Docker Compose](https://docs.docker.com/get-docker/) (Optional, for easy database setup)
 
 ### Installation
 
 Install the `mcp-telegram` CLI tool:
 
 ```bash
-uv tool install mcp-telegram
+uv tool install mcp-telegram --force
 ```
 
 ## ⚙️ Usage
@@ -59,78 +61,51 @@ uv tool install mcp-telegram
 > [!IMPORTANT]
 > Please ensure you have read and understood Telegram's [ToS](https://telegram.org/tos) before using this tool. Misuse of this tool may result in account restrictions.
 
-The `mcp-telegram` command-line tool is your entry point.
+### The Setup Wizard (Recommended)
+
+**New in v0.3.0**: The interactive setup wizard handles everything for you.
 
 ```bash
-mcp-telegram --help # See all commands
+mcp-telegram setup
 ```
+
+This wizard will:
+1. **Configure PostgreSQL** (detects local or starts via Docker Compose)
+2. **Run Migrations** to set up the database schema
+3. **Set API Credentials** (ID and Hash from [my.telegram.org](https://my.telegram.org/apps))
+4. **Authenticate** with your phone number and code
+5. **Generate `.env`** for the daemon mode
 
 ### Login
 
-First, authenticate with your Telegram account:
+If you already have a database configured and just need to authenticate a new account:
 
 ```bash
 mcp-telegram login
 ```
 
-This interactive command will prompt you for:
-
-- **API ID & API Hash:** Obtain these from [my.telegram.org/apps](https://my.telegram.org/apps).
-- **Phone Number:** Your Telegram-registered phone number (international format, e.g., `+1234567890`).
-- **Verification Code:** Sent to your Telegram account upon first login.
-- **2FA Password:** If you have Two-Factor Authentication enabled.
-
-Your credentials are securely stored in the session file for future use.
-
-> [!WARNING]
-> Keep your API credentials private and never share them publicly
-
-> [!NOTE]
-> Use `mcp-telegram logout` to logout from current session or `mcp-telegram clear-session` to remove all stored session data.
-
 ### Connect to the MCP server
 
-To use MCP Telegram with MCP clients like Claude Desktop or Cursor, you'll need to configure the MCP server. The configuration process varies by client and operating system.
-
-For detailed setup instructions, please refer to:
-
-- [Claude Desktop MCP Setup Guide](https://modelcontextprotocol.io/quickstart/user)
-- [Cursor MCP Documentation](https://docs.cursor.com/context/model-context-protocol)
-
-The configuration file should contain:
+To use MCP Telegram with clients like Claude Desktop or Cursor, add it to your configuration:
 
 ```json
 {
   "mcpServers": {
     "mcp-telegram": {
-      "command": "mcp-telegram" /* Use full path if client can't find the command (e.g. "/usr/local/bin/mcp-telegram"). See IMPORTANT section below for full path instructions. */,
-      "args": ["start"],
+      "command": "mcp-telegram",
+      "args": ["start", "--daemon"],
       "env": {
-        "API_ID": "<your_api_id>",
-        "API_HASH": "<your_api_hash>"
+        "DAEMON_URL": "http://localhost:8765"
       }
     }
   }
 }
 ```
 
-> [!Note]
-> Configuration paths vary by OS and client. For example:
->
-> - macOS: `~/Library/Application Support/Claude/` or `~/.cursor/`
-> - Windows: `%APPDATA%\Claude\` or `%APPDATA%\Cursor\`
-
-> [!IMPORTANT]
-> If your client cannot execute `mcp-telegram` despite it being accessible in the terminal, try using the full path to the executable. You can find this by running `which mcp-telegram` (macOS/Linux) or `where mcp-telegram` (Windows) in your terminal. Replace the `command` value in the configuration with the full path.
-
-After saving the configuration file, restart your application.
-
 ### Multi-Terminal Mode (Daemon)
 
 > [!NOTE]
-> **New in v0.2.0**: Use Telegram from multiple terminals without re-authentication!
-
-By default, each MCP server instance connects directly to Telegram using SQLite sessions, which can cause conflicts. The new **daemon mode** solves this by running a single Telegram connection that multiple terminals can share.
+> **Powered by PostgreSQL**: Version 0.3.0 uses a robust PostgreSQL backend for session sharing, fixing conflict issues common with SQLite.
 
 #### Architecture
 
@@ -148,70 +123,16 @@ By default, each MCP server instance connects directly to Telegram using SQLite 
                               └──────────┘
 ```
 
-The daemon uses PostgreSQL for session storage, enabling:
-- **Shared sessions** across multiple terminals
-- **Persistent authentication** - login once, use everywhere
-- **No conflicts** - single Telegram connection managed centrally
+#### Running the Daemon
 
-#### Quick Start with Docker (Recommended)
-
-1. **Create `.env` file**:
-```bash
-cp .env.example .env
-# Edit .env with your API_ID and API_HASH
-```
-
-2. **Start the stack**:
+**Option A: Using Docker (Fastest)**
 ```bash
 docker-compose up -d
 ```
 
-This starts:
-- PostgreSQL database (auto-migrates schema)
-- Telegram daemon (connects to Telegram)
-
-3. **Login (first time only)**:
+**Option B: Manual Start**
 ```bash
-docker-compose exec daemon mcp-telegram login
-```
-
-4. **Configure your MCP client**:
-```json
-{
-  "mcpServers": {
-    "mcp-telegram": {
-      "command": "mcp-telegram",
-      "args": ["start", "--daemon"],
-      "env": {
-        "DAEMON_URL": "http://localhost:8765"
-      }
-    }
-  }
-}
-```
-
-#### Manual Setup (Without Docker)
-
-**One command setup:**
-```bash
-mcp-telegram setup
-```
-
-This wizard will:
-1. Create PostgreSQL database
-2. Run migrations
-3. Create `.env` file
-4. Authenticate with Telegram
-5. Optionally start the daemon
-
-**Or step-by-step:**
-
-```bash
-# 1. Create database (if not exists)
-createdb mcp_telegram
-
-# 2. Run setup wizard
-mcp-telegram setup
+mcp-telegram daemon
 ```
 
 #### Environment Variables
@@ -222,108 +143,32 @@ mcp-telegram setup
 | `API_HASH` | Telegram API Hash | Required |
 | `DATABASE_URL` | PostgreSQL connection string | Required for daemon |
 | `DAEMON_URL` | Daemon HTTP endpoint | `http://localhost:8765` |
-| `DAEMON_HOST` | Daemon bind host | `0.0.0.0` |
-| `DAEMON_PORT` | Daemon HTTP port | `8765` |
-
-#### Commands
-
-| Command | Description |
-|---------|-------------|
-| `mcp-telegram daemon` | Start the Telegram daemon |
-| `mcp-telegram start --daemon` | Start MCP server in daemon mode |
-| `mcp-telegram start` | Start MCP server in direct mode (legacy) |
-| `mcp-telegram setup` | Interactive setup wizard |
-| `mcp-telegram tools` | List all available MCP tools |
-
-#### Migration from Single-Terminal
-
-If you were using the direct mode before:
-
-1. Export your session or simply login again in daemon mode
-2. Update your MCP client config to use `["start", "--daemon"]`
-3. Start the daemon before using MCP clients
-
-The old `mcp-telegram start` (without `--daemon`) still works for single-terminal use.
 
 ## 🧰 Available Tools
 
-Here's a comprehensive list of tools you can use to interact with Telegram through MCP:
-
-### 📨 Messaging Tools
-
-| Tool             | Description                                                   |
-| ---------------- | ------------------------------------------------------------- |
-| `send_message`   | ✉️ Send text messages or files to any user, group, or channel |
-| `edit_message`   | ✏️ Modify content of previously sent messages                 |
-| `delete_message` | 🗑️ Remove one or multiple messages                            |
-| `get_messages`   | 📜 Retrieve message history with advanced filtering options   |
-
-### 🔍 Search & Navigation
-
-| Tool                | Description                                             |
-| ------------------- | ------------------------------------------------------- |
-| `search_dialogs`    | 🔎 Find users, groups, and channels by name or username |
-| `message_from_link` | 🔗 Access specific messages using Telegram links        |
-
-### 📝 Draft Management
-
-| Tool        | Description                                |
-| ----------- | ------------------------------------------ |
-| `get_draft` | 📋 View current message draft for any chat |
-| `set_draft` | ✍️ Create or clear message drafts          |
-
-### 📂 Media Handling
-
-| Tool             | Description                                             |
-| ---------------- | ------------------------------------------------------- |
-| `media_download` | 📸 Download photos, videos, and documents from messages |
-
-> [!Note]
-> For detailed parameter information and example use cases, run `mcp-telegram tools` in your terminal.
+| Tool | Description |
+|------|-------------|
+| `send_message` | ✉️ Send text or files to users/groups/channels |
+| `edit_message` | ✏️ Edit previously sent messages |
+| `search_dialogs` | 🔎 Find chats by name or username |
+| `get_messages` | 📜 Retrieve chat history |
+| `get_draft` | 📋 View current message drafts |
+| `media_download` | 📸 Download photos/videos from messages |
 
 ## 🛠️ Troubleshooting
 
-### Database Locked Errors (Direct Mode)
+### Session Authentication Errors
+If you see `'NoneType' object has no attribute 'access_hash'`, it usually means the session cache is inconsistent. 
+**Fix**: 
+1. `docker-compose down -v` (if using Docker)
+2. `mcp-telegram setup` to re-initialize from scratch.
 
-Running multiple `mcp-telegram` instances using the _same session file_ can cause `database is locked` errors due to Telethon's SQLite session storage. Ensure only one instance uses a session file at a time.
-
-**Solution**: Use daemon mode (`mcp-telegram start --daemon`) which supports multiple terminals.
-
-<details>
-<summary>Force-Stopping Existing Processes</summary>
-
-If you need to stop potentially stuck processes:
-
-- **macOS / Linux:** `pkill -f "mcp-telegram"`
-- **Windows:** `taskkill /F /IM mcp-telegram.exe /T` (Check Task Manager for the exact process name)
-
-</details>
-
-### Daemon Connection Errors
-
-If MCP servers can't connect to the daemon:
-
-1. **Check daemon is running**: `curl http://localhost:8765/health`
-2. **Check environment**: Ensure `DAEMON_URL` is set correctly
-3. **Check Docker**: `docker-compose ps` to verify services are healthy
-
-### Docker Issues
-
-```bash
-# View daemon logs
-docker-compose logs -f daemon
-
-# Restart services
-docker-compose restart
-
-# Reset everything (WARNING: deletes data)
-docker-compose down -v
-docker-compose up -d
-```
+### Database Connection
+Ensure PostgreSQL is running and the `DATABASE_URL` in your `.env` is correct. The setup wizard can automatically start a Docker container for you if Docker is installed.
 
 ## 🤝 Contributing
 
-We welcome contributions! If you'd like to help improve MCP Telegram, please feel free to submit issues, feature requests, or pull requests. Your feedback and contributions help make this project better for everyone.
+We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
 ## 📝 License
 

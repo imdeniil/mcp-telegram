@@ -114,6 +114,10 @@ async def login() -> None:
         console.print("\n[dim]Daemon mode: Using PostgreSQL session storage[/dim]")
 
     tg = Telegram()
+    client = None
+    pool = None
+    session = None
+    account_id = None
 
     console.print("\n[yellow]Please enter your credentials:[/yellow]")
 
@@ -128,6 +132,7 @@ async def login() -> None:
                 "[dim]Enter your Telegram API ID (found on my.telegram.org)[/dim]\n"
                 "> "
             )
+        api_id = int(api_id)
 
         if not api_hash:
             api_hash = console.input(
@@ -146,10 +151,11 @@ async def login() -> None:
 
         # For PostgreSQL mode, we need to setup the session differently
         if use_postgres:
-            import asyncpg
             from uuid import uuid4
+
             from telethon import TelegramClient
-            from mcp_telegram.session import create_session_pool, PostgresSession
+
+            from mcp_telegram.session import create_session_pool
 
             # Create database pool
             pool = await create_session_pool(database_url)
@@ -157,7 +163,8 @@ async def login() -> None:
             # Get or create account
             async with pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    "SELECT id FROM telegram_accounts WHERE is_active = TRUE ORDER BY created_at LIMIT 1"
+                    "SELECT id FROM telegram_accounts "
+                    "WHERE is_active = TRUE ORDER BY created_at LIMIT 1"
                 )
 
                 if row:
@@ -166,21 +173,22 @@ async def login() -> None:
                 else:
                     # Create new account
                     account_id = uuid4()
+                    console.print(f"[dim]DEBUG: Creating account with name='Main', api_id={api_id}[/dim]")
                     await conn.execute(
-                        """
-                        INSERT INTO telegram_accounts (id, api_id, api_hash, phone, is_active)
-                        VALUES ($1, $2, $3, $4, TRUE)
-                        """,
+                        "INSERT INTO telegram_accounts "
+                        "(id, name, api_id, api_hash, phone, is_active) "
+                        "VALUES ($1, $2, $3, $4, $5, TRUE)",
                         account_id,
-                        str(api_id),
+                        "Main",
+                        int(api_id),
                         api_hash,
                         phone,
                     )
                     console.print("[dim]Created new account[/dim]")
 
             # Initialize PostgreSQL session
-            session = PostgresSession(pool, account_id)
-            await session._init_session()
+            from mcp_telegram.session import init_session
+            session = await init_session(pool, account_id)
 
             # Create client with PostgreSQL session
             client = TelegramClient(
@@ -229,7 +237,8 @@ async def login() -> None:
                 await conn.execute(
                     """
                     UPDATE telegram_accounts
-                    SET user_id = $1, username = $2, updated_at = NOW()
+                    SET user_id = $1, username = $2,
+                        last_connected_at = NOW(), updated_at = NOW()
                     WHERE id = $3
                     """,
                     me.id,
@@ -237,7 +246,7 @@ async def login() -> None:
                     account_id,
                 )
             # Wait for fire-and-forget save to complete
-            await asyncio.sleep(0.5)
+            await session.wait_for_pending_saves()
 
         console.print("\n[bold green]✓[/bold green] [dim]Successfully logged in[/dim]")
 
@@ -252,12 +261,6 @@ async def login() -> None:
             )
         )
 
-        # Cleanup
-        if client.is_connected():
-            await client.disconnect()
-        if use_postgres:
-            await pool.close()
-
     except ValueError:
         console.print(
             "\n[bold red]✗ Error:[/bold red] API ID must be a number", style="red"
@@ -266,6 +269,15 @@ async def login() -> None:
     except Exception as e:
         console.print(f"\n[bold red]✗ Error:[/bold red] {str(e)}", style="red")
         sys.exit(1)
+    finally:
+        # Cleanup
+        if client and client.is_connected():
+            await client.disconnect()
+        if session and hasattr(session, "wait_for_pending_saves"):
+            await session.wait_for_pending_saves()
+            await asyncio.sleep(0.5)
+        if pool:
+            await pool.close()
 
 
 @app.command()
@@ -311,7 +323,8 @@ def daemon(
 
     if not api_id or not api_hash:
         console.print(
-            "[bold red]Error:[/bold red] API_ID and API_HASH environment variables not set.\n"
+            "[bold red]Error:[/bold red] API_ID and API_HASH "
+            "environment variables not set.\n"
             "Run 'mcp-telegram login' first or set them manually."
         )
         raise typer.Exit(1)
@@ -347,8 +360,12 @@ def setup() -> None:
 
     All-in-one setup: database, credentials, login, and optionally start daemon.
     """
-    # Run async setup and get config for daemon if needed
-    result = asyncio.run(_async_setup())
+    try:
+        # Run async setup and get config for daemon if needed
+        result = asyncio.run(_async_setup())
+    except Exception as e:
+        console.print(f"[bold red]✗[/bold red] Error during setup: {e}")
+        return
 
     # Start daemon outside of async context if requested
     if result and result.get("start_daemon"):
@@ -373,13 +390,13 @@ def setup() -> None:
 
         console.print(
             Panel.fit(
-                f"[bold green]Daemon Running![/bold green]\n\n"
-                f"[dim]Host:[/dim] 0.0.0.0\n"
-                f"[dim]Port:[/dim] 8765\n\n"
-                f"[yellow]In another terminal, run:[/yellow]\n"
-                f"  [bold]mcp-telegram start --daemon[/bold]\n\n"
-                f"[dim]Or configure MCP client:[/dim]\n"
-                f'  [bold]"args": ["start", "--daemon"][/bold]',
+                "[bold green]Daemon Running![/bold green]\n\n"
+                "[dim]Host:[/dim] 0.0.0.0\n"
+                "[dim]Port:[/dim] 8765\n\n"
+                "[yellow]In another terminal, run:[/yellow]\n"
+                "  [bold]mcp-telegram start --daemon[/bold]\n\n"
+                "[dim]Or configure MCP client:[/dim]\n"
+                '  [bold]"args": ["start", "--daemon"][/bold]',
                 title="🚀 Daemon Mode",
                 border_style="green",
             )
@@ -388,8 +405,30 @@ def setup() -> None:
         run_daemon(config)
 
 
+import sys
+import traceback
+
+def version_callback(value: bool):
+    if value:
+        print("mcp-telegram version 0.2.1")
+        raise typer.Exit()
+
+@app.callback()
+def main(
+    version: bool = typer.Option(
+        None, "--version", callback=version_callback, is_eager=True, help="Show version"
+    ),
+):
+    """MCP Telegram CLI."""
+    pass
+
 async def _async_setup() -> dict | None:
     """Async part of setup wizard."""
+    pool = None
+    client = None
+    session = None
+    account_id = None
+
     console.print(
         Panel.fit(
             "[bold blue]MCP Telegram Setup Wizard[/bold blue]\n\n"
@@ -433,13 +472,123 @@ async def _async_setup() -> dict | None:
     console.print("\n[bold cyan]━━━ Step 3/4: Database Setup ━━━[/bold cyan]")
 
     pool = None
+    import subprocess
+
+    from pathlib import Path
+
+    import asyncpg
+
+    database_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+    postgres_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/postgres"
+
+    async def check_postgres_connection(url: str) -> bool:
+        """Check if PostgreSQL is accessible."""
+        try:
+            conn = await asyncio.wait_for(
+                asyncpg.connect(url),
+                timeout=3.0
+            )
+            await conn.close()
+            return True
+        except Exception:
+            return False
+
+    async def wait_for_postgres(url: str, max_attempts: int = 30) -> bool:
+        """Wait for PostgreSQL to become available."""
+        for attempt in range(max_attempts):
+            if await check_postgres_connection(url):
+                return True
+            await asyncio.sleep(1)
+            if attempt % 5 == 4:
+                console.print(
+                    f"[dim]Still waiting for PostgreSQL... "
+                    f"({attempt + 1}/{max_attempts})[/dim]"
+                )
+        return False
+
+    # Check if PostgreSQL is already running with user's config
+    if await check_postgres_connection(postgres_url):
+        console.print("[bold green]✓[/bold green] PostgreSQL is already running")
+    else:
+        console.print(
+            "[yellow]PostgreSQL is not running with "
+            "specified configuration.[/yellow]"
+        )
+
+        # Check if docker-compose.yml exists
+        compose_file = Path("docker-compose.yml")
+        if not compose_file.exists():
+            console.print("[bold red]✗[/bold red] No docker-compose.yml found.")
+            raise typer.Exit(1)
+
+        use_docker = Confirm.ask(
+            "Start PostgreSQL via Docker with your configuration?",
+            default=True
+        )
+
+        if not use_docker:
+            console.print(
+                "[yellow]Please start PostgreSQL manually and "
+                "run setup again.[/yellow]"
+            )
+            raise typer.Exit(1)
+
+        console.print(
+            "[dim]Starting PostgreSQL container with your configuration...[/dim]"
+        )
+
+        try:
+            # Set environment variables for docker-compose
+            env = os.environ.copy()
+            env["DB_USER"] = db_user
+            env["DB_PASSWORD"] = db_password
+            env["DB_NAME"] = db_name
+            env["DB_PORT"] = str(db_port)
+
+            # Stop existing container if any
+            subprocess.run(
+                ["docker-compose", "down"],
+                capture_output=True,
+                env=env,
+            )
+
+            # Start postgres container with user's configuration
+            result = subprocess.run(
+                ["docker-compose", "up", "-d", "postgres"],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+            if result.returncode != 0:
+                console.print(
+                    f"[bold red]✗[/bold red] Failed to start container: "
+                    f"{result.stderr}"
+                )
+                raise typer.Exit(1)
+
+            console.print("[bold green]✓[/bold green] PostgreSQL container started")
+
+            # Wait for PostgreSQL to be ready
+            console.print("[dim]Waiting for PostgreSQL to be ready...[/dim]")
+            if not await wait_for_postgres(postgres_url):
+                console.print(
+                    "[bold red]✗[/bold red] PostgreSQL did not "
+                    "become ready in time"
+                )
+                raise typer.Exit(1)
+
+            console.print("[bold green]✓[/bold green] PostgreSQL is ready")
+
+        except FileNotFoundError:
+            console.print(
+                "[bold red]✗[/bold red] docker-compose not found. "
+                "Please install Docker Compose."
+            )
+            raise typer.Exit(1)
+
+    # Create database and run migrations
     try:
-        import asyncpg
-        from pathlib import Path
-
-        # Connect to postgres (default database) to create our database
-        postgres_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/postgres"
-
         with console.status("[bold green]Connecting to PostgreSQL..."):
             conn = await asyncpg.connect(postgres_url)
 
@@ -464,22 +613,30 @@ async def _async_setup() -> dict | None:
             # Check if schema exists
             async with pool.acquire() as conn:
                 version = await conn.fetchval(
-                    "SELECT 1 FROM information_schema.tables WHERE table_name = 'schema_version'"
+                    "SELECT 1 FROM information_schema.tables "
+                    "WHERE table_name = 'schema_version'"
                 )
 
                 if not version:
                     # Run migrations
-                    migrations_dir = Path(__file__).parent.parent.parent / "migrations"
+                    migrations_dir = (
+                        Path(__file__).parent.parent.parent / "migrations"
+                    )
                     if migrations_dir.exists():
-                        for migration_file in sorted(migrations_dir.glob("*.sql")):
-                            console.print(f"[dim]Running {migration_file.name}...[/dim]")
+                        for migration_file in sorted(
+                            migrations_dir.glob("*.sql")
+                        ):
+                            console.print(
+                                f"[dim]Running {migration_file.name}...[/dim]"
+                            )
                             sql = migration_file.read_text()
                             await conn.execute(sql)
                         console.print("[bold green]✓[/bold green] Migrations completed")
                     else:
                         console.print(
                             "[yellow]⚠[/yellow] Migrations directory not found. "
-                            "Run manually: psql -d {db_name} -f migrations/001_initial_schema.sql"
+                            "Run manually: psql -d {db_name} "
+                            "-f migrations/001_initial_schema.sql"
                         )
                 else:
                     console.print("[bold green]✓[/bold green] Schema already exists")
@@ -487,17 +644,14 @@ async def _async_setup() -> dict | None:
         console.print("[bold green]✓[/bold green] Database setup complete")
     except Exception as e:
         console.print(f"[bold red]✗[/bold red] Database setup failed: {e}")
-        console.print(
-            "\n[yellow]Tip:[/yellow] Make sure PostgreSQL is running.\n"
-            "Or use Docker:\n"
-            "  [bold]docker-compose up -d postgres[/bold]"
-        )
         raise typer.Exit(1)
 
     # ========================================
     # Step 4: Telegram Authentication
     # ========================================
-    console.print("\n[bold cyan]━━━ Step 4/4: Telegram Authentication ━━━[/bold cyan]")
+    console.print(
+        "\n[bold cyan]━━━ Step 4/4: Telegram Authentication ━━━[/bold cyan]"
+    )
 
     phone = Prompt.ask(
         "Phone number",
@@ -505,17 +659,21 @@ async def _async_setup() -> dict | None:
     )
 
     if not phone:
-        console.print("[yellow]Skipping authentication. Run 'mcp-telegram login' later.[/yellow]")
+        console.print(
+            "[yellow]Skipping authentication. "
+            "Run 'mcp-telegram login' later.[/yellow]"
+        )
     else:
         try:
             from uuid import uuid4
+
             from telethon import TelegramClient
-            from mcp_telegram.session import PostgresSession
 
             # Get or create account
             async with pool.acquire() as conn:  # type: ignore
                 row = await conn.fetchrow(
-                    "SELECT id FROM telegram_accounts WHERE is_active = TRUE ORDER BY created_at LIMIT 1"
+                    "SELECT id FROM telegram_accounts "
+                    "WHERE is_active = TRUE ORDER BY created_at LIMIT 1"
                 )
 
                 if row:
@@ -524,21 +682,22 @@ async def _async_setup() -> dict | None:
                 else:
                     # Create new account
                     account_id = uuid4()
+                    console.print(f"[dim]DEBUG: Creating account with name='Main', api_id={api_id}[/dim]")
                     await conn.execute(
-                        """
-                        INSERT INTO telegram_accounts (id, api_id, api_hash, phone, is_active)
-                        VALUES ($1, $2, $3, $4, TRUE)
-                        """,
+                        "INSERT INTO telegram_accounts "
+                        "(id, name, api_id, api_hash, phone, is_active) "
+                        "VALUES ($1, $2, $3, $4, $5, TRUE)",
                         account_id,
-                        str(api_id),
+                        "Main",
+                        int(api_id),
                         api_hash,
                         phone,
                     )
                     console.print("[dim]Created new account[/dim]")
 
             # Initialize PostgreSQL session
-            session = PostgresSession(pool, account_id)  # type: ignore
-            await session._init_session()
+            from mcp_telegram.session import init_session
+            session = await init_session(pool, account_id)
 
             # Create client with PostgreSQL session
             client = TelegramClient(
@@ -547,7 +706,9 @@ async def _async_setup() -> dict | None:
                 api_hash=api_hash,
             )
 
-            with console.status("[bold green]Connecting to Telegram...", spinner="dots"):
+            with console.status(
+                "[bold green]Connecting to Telegram...", spinner="dots"
+            ):
                 await client.connect()
                 console.print("[bold green]✓[/bold green] Connected to Telegram")
 
@@ -582,7 +743,8 @@ async def _async_setup() -> dict | None:
                 await conn.execute(
                     """
                     UPDATE telegram_accounts
-                    SET user_id = $1, username = $2, updated_at = NOW()
+                    SET user_id = $1, username = $2,
+                        last_connected_at = NOW(), updated_at = NOW()
                     WHERE id = $3
                     """,
                     me.id,
@@ -593,10 +755,20 @@ async def _async_setup() -> dict | None:
             console.print(f"[bold green]✓[/bold green] Logged in as {me.first_name}")
 
             await client.disconnect()
+            if session and hasattr(session, "wait_for_pending_saves"):
+                await session.wait_for_pending_saves()
+            # Give a bit more time for the database driver to finish
+            await asyncio.sleep(0.5)
 
-        except Exception as e:
-            console.print(f"[bold red]✗[/bold red] Authentication failed: {e}")
+        except Exception:
+            console.print("\n[bold red]✗[/bold red] Authentication failed")
+            # Use the traceback module to be 100% sure we see the error
+            import traceback
+            console.print(traceback.format_exc())
             console.print("[dim]You can retry with 'mcp-telegram login' later[/dim]")
+            if session and hasattr(session, "wait_for_pending_saves"):
+                await session.wait_for_pending_saves()
+            await asyncio.sleep(0.5)
 
     # Close pool
     if pool:
@@ -635,40 +807,13 @@ DAEMON_PORT=8765
     )
 
     if start_daemon:
-        console.print("\n[bold green]Starting daemon...[/bold green]")
-        console.print("[dim]Press Ctrl+C to stop[/dim]\n")
-
-        # Set environment variables for daemon
-        os.environ["DATABASE_URL"] = database_url
-        os.environ["API_ID"] = api_id
-        os.environ["API_HASH"] = api_hash
-
-        # Import and run daemon
-        from mcp_telegram.daemon import DaemonConfig, run_daemon
-
-        config = DaemonConfig(
-            database_url=database_url,
-            api_id=int(api_id),
-            api_hash=api_hash,
-            host="0.0.0.0",
-            port=8765,
-        )
-
-        console.print(
-            Panel.fit(
-                f"[bold green]Daemon Running![/bold green]\n\n"
-                f"[dim]Host:[/dim] 0.0.0.0\n"
-                f"[dim]Port:[/dim] 8765\n\n"
-                f"[yellow]In another terminal, run:[/yellow]\n"
-                f"  [bold]mcp-telegram start --daemon[/bold]\n\n"
-                f"[dim]Or configure MCP client:[/dim]\n"
-                f'  [bold]"args": ["start", "--daemon"][/bold]',
-                title="🚀 Daemon Mode",
-                border_style="green",
-            )
-        )
-
-        run_daemon(config)
+        # Return config for daemon startup (handled outside async context)
+        return {
+            "start_daemon": True,
+            "database_url": database_url,
+            "api_id": api_id,
+            "api_hash": api_hash,
+        }
     else:
         # Final instructions
         console.print(

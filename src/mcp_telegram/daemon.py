@@ -107,6 +107,26 @@ def get_client() -> TelegramClient:
     return _client
 
 
+async def _run_schema_migrations(pool: asyncpg.Pool) -> None:
+    """Run database migrations from the migrations directory."""
+    from pathlib import Path
+
+    migrations_dir = Path(__file__).parent.parent.parent / "migrations"
+    if not migrations_dir.exists():
+        logger.warning(f"Migrations directory not found at {migrations_dir}")
+        return
+
+    async with pool.acquire() as conn:
+        for migration_file in sorted(migrations_dir.glob("*.sql")):
+            logger.info(f"Running migration {migration_file.name}...")
+            try:
+                sql = migration_file.read_text()
+                await conn.execute(sql)
+            except Exception as e:
+                logger.error(f"Failed to run migration {migration_file.name}: {e}")
+                raise
+
+
 @asynccontextmanager
 async def daemon_lifespan(app: FastAPI):
     """Manage daemon lifecycle - connect on startup, disconnect on shutdown."""
@@ -120,19 +140,42 @@ async def daemon_lifespan(app: FastAPI):
     _db_pool = await create_session_pool(config.database_url)
     logger.info("Connected to PostgreSQL")
 
+    # Check if telegram_accounts table exists, create schema if needed
+    try:
+        table_exists = await _db_pool.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_name = 'telegram_accounts'
+            )
+            """
+        )
+
+        if not table_exists:
+            logger.info("Database schema not found. Creating tables...")
+            await _run_schema_migrations(_db_pool)
+            logger.info("Database schema created successfully")
+        else:
+            logger.info("Database schema already exists")
+    except Exception as e:
+        logger.error(f"Error checking/creating schema: {e}")
+        raise
+
     # Get or create account
     if config.account_id:
         _account_id = config.account_id
     else:
         # Try to find existing account
         row = await _db_pool.fetchrow(
-            "SELECT id FROM telegram_accounts WHERE is_active = TRUE ORDER BY created_at LIMIT 1"
+            "SELECT id FROM telegram_accounts "
+            "WHERE is_active = TRUE ORDER BY created_at LIMIT 1"
         )
         if row:
             _account_id = row["id"]
         else:
             raise RuntimeError(
-                "No account found. Run 'mcp-telegram setup' first or set API_ID/API_HASH"
+                "No account found. Run 'mcp-telegram setup' first "
+                "or set API_ID/API_HASH"
             )
 
     # Initialize session
@@ -156,12 +199,31 @@ async def daemon_lifespan(app: FastAPI):
     me = await _client.get_me()
     logger.info(f"Connected to Telegram as {me.first_name}")
 
+    # Update account info in database
+    try:
+        async with _db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE telegram_accounts
+                SET user_id = $1, username = $2,
+                    last_connected_at = NOW(), updated_at = NOW()
+                WHERE id = $3
+                """,
+                me.id,
+                getattr(me, "username", None),
+                _account_id,
+            )
+    except Exception as e:
+        logger.warning(f"Failed to update account info in DB: {e}")
+
     yield
 
     # Cleanup
     logger.info("Shutting down Telegram daemon...")
     if _client:
         await _client.disconnect()
+    if _session and hasattr(_session, "wait_for_pending_saves"):
+        await _session.wait_for_pending_saves()
     if _db_pool:
         await _db_pool.close()
     logger.info("Daemon stopped")
@@ -312,7 +374,9 @@ async def search_dialogs(
             results = await client.get_dialogs(limit=req.limit)
             # Filter locally
             query = req.query.lower()
-            results = [d for d in results if query in (d.name or "").lower()][: req.limit]
+            results = [
+                d for d in results if query in (d.name or "").lower()
+            ][: req.limit]
 
         dialogs = []
         for dialog in results:
@@ -339,12 +403,20 @@ async def get_draft(req: SetDraftRequest, client: TelegramClient = Depends(get_c
     """Get draft for an entity."""
     try:
         entity = await parse_entity(client, req.entity)
-        # get_drafts() returns a list, need to find the matching draft
-        drafts = await client.get_drafts()
-        entity_id = get_peer_id(entity)
-        for draft in drafts:
-            if get_peer_id(draft.entity) == entity_id:
-                return {"draft": draft.text}
+        # get_drafts(entity) returns a single custom.Draft object for that entity
+        # or a list if entity is None. We pass entity to get exactly what we need.
+        draft = await client.get_drafts(entity)
+
+        if draft and hasattr(draft, "text") and draft.text:
+            return {"draft": draft.text}
+
+        # Fallback: if it returned a list, find the matching one
+        if isinstance(draft, list) and draft:
+            entity_id = get_peer_id(entity)
+            for d in draft:
+                if get_peer_id(d.entity) == entity_id:
+                    return {"draft": d.text}
+
         return {"draft": None}
     except Exception as e:
         logger.error(f"Error getting draft: {e}")

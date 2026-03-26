@@ -137,7 +137,9 @@ class DaemonClient:
 
     async def get_draft(self, entity: str | int) -> dict[str, Any]:
         """Get draft."""
-        return await self._request("POST", "/get_draft", json={"entity": entity, "message": ""})
+        return await self._request(
+            "POST", "/get_draft", json={"entity": entity, "message": ""}
+        )
 
     async def set_draft(self, entity: str | int, message: str) -> dict[str, Any]:
         """Set draft."""

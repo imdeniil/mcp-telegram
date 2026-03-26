@@ -385,7 +385,8 @@ class Telegram:
                         types.ChannelParticipantBanned,
                     ):
                         logger.warning(
-                            f"Unexpected participant type: {type(permissions.participant)}"
+                            f"Unexpected participant type: "
+                            f"{type(permissions.participant)}"
                         )
                         return False
                     return not permissions.participant.banned_rights.send_messages
