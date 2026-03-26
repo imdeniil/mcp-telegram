@@ -5,18 +5,23 @@ for multiple MCP servers to use, solving the SQLite locking issue.
 """
 
 import logging
+import os
+import signal
+import asyncio
 
 from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID
+from pathlib import Path
 
 import asyncpg
 import uvicorn
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from telethon import TelegramClient
+from telethon import TelegramClient, errors
 from telethon.utils import get_peer_id
 
 from mcp_telegram.session import PostgresSession, create_session_pool, init_session
@@ -100,11 +105,17 @@ class DownloadMediaRequest(BaseModel):
     path: str | None = None
 
 
-def get_client() -> TelegramClient:
-    """Dependency to get the Telegram client."""
-    if _client is None:
-        raise HTTPException(status_code=503, detail="Telegram client not connected")
-    return _client
+class SendCodeRequest(BaseModel):
+    """Request to send auth code."""
+    phone: str
+
+
+class SignInRequest(BaseModel):
+    """Request to sign in with code or 2FA."""
+    phone: str
+    code: str | None = None
+    phone_code_hash: str | None = None
+    password: str | None = None
 
 
 async def _run_schema_migrations(pool: asyncpg.Pool) -> None:
@@ -143,12 +154,12 @@ async def daemon_lifespan(app: FastAPI):
     # Check if telegram_accounts table exists, create schema if needed
     try:
         table_exists = await _db_pool.fetchval(
-            """
+            \"\"\"
             SELECT EXISTS (
                 SELECT 1 FROM information_schema.tables
                 WHERE table_name = 'telegram_accounts'
             )
-            """
+            \"\"\"
         )
 
         if not table_exists:
@@ -159,62 +170,59 @@ async def daemon_lifespan(app: FastAPI):
             logger.info("Database schema already exists")
     except Exception as e:
         logger.error(f"Error checking/creating schema: {e}")
-        raise
 
-    # Get or create account
+    # Identify account
     if config.account_id:
         _account_id = config.account_id
     else:
         # Try to find existing account
         row = await _db_pool.fetchrow(
-            "SELECT id FROM telegram_accounts "
-            "WHERE is_active = TRUE ORDER BY created_at LIMIT 1"
+            \"\"\"
+            SELECT id FROM telegram_accounts
+            WHERE is_active = TRUE ORDER BY created_at LIMIT 1
+            \"\"\"
         )
         if row:
             _account_id = row["id"]
         else:
-            raise RuntimeError(
-                "No account found. Run 'mcp-telegram setup' first "
-                "or set API_ID/API_HASH"
-            )
+            # We allow daemon to start without account for web auth
+            logger.warning("No account found. Use web interface to login.")
 
-    # Initialize session
-    _session = await init_session(_db_pool, _account_id)
-
-    # Create Telegram client
-    _client = TelegramClient(
-        session=_session,
-        api_id=config.api_id,
-        api_hash=config.api_hash,
-    )
-
-    # Connect
-    await _client.connect()
-
-    if not await _client.is_user_authorized():
-        raise RuntimeError(
-            "Not authorized. Run 'mcp-telegram login' first or use the setup wizard."
+    # Initialize session and client if we have an account
+    if _account_id:
+        _session = await init_session(_db_pool, _account_id)
+        _client = TelegramClient(
+            session=_session,
+            api_id=config.api_id,
+            api_hash=config.api_hash,
         )
-
-    me = await _client.get_me()
-    logger.info(f"Connected to Telegram as {me.first_name}")
-
-    # Update account info in database
-    try:
-        async with _db_pool.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE telegram_accounts
-                SET user_id = $1, username = $2,
-                    last_connected_at = NOW(), updated_at = NOW()
-                WHERE id = $3
-                """,
-                me.id,
-                getattr(me, "username", None),
-                _account_id,
-            )
-    except Exception as e:
-        logger.warning(f"Failed to update account info in DB: {e}")
+        await _client.connect()
+        
+        if await _client.is_user_authorized():
+            me = await _client.get_me()
+            logger.info(f"Connected to Telegram as {me.first_name}")
+            
+            # Update account info in database
+            try:
+                async with _db_pool.acquire() as conn:
+                    await conn.execute(
+                        \"\"\"
+                        UPDATE telegram_accounts
+                        SET user_id = $1, username = $2,
+                            last_connected_at = NOW(), updated_at = NOW()
+                        WHERE id = $3
+                        \"\"\",
+                        me.id,
+                        getattr(me, "username", None),
+                        _account_id,
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to update account info in DB: {e}")
+        else:
+            logger.warning("Account not authorized. Waiting for web login.")
+    else:
+        # Client will be initialized during auth flow
+        pass
 
     yield
 
@@ -231,8 +239,6 @@ async def daemon_lifespan(app: FastAPI):
 
 app = FastAPI(
     title="MCP Telegram Daemon",
-    description="Single-process daemon for Telegram connectivity",
-    version="1.0.0",
     lifespan=daemon_lifespan,
 )
 
@@ -245,45 +251,191 @@ app.add_middleware(
 )
 
 
-# Health check
+# Dependency
+async def get_client() -> TelegramClient:
+    global _client
+    if _client is None:
+        raise HTTPException(status_code=503, detail="Telegram client not initialized")
+    if not await _client.is_user_authorized():
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return _client
+
+
+# Web UI
+@app.get("/", include_in_schema=False)
+async def dashboard():
+    """Serve the web dashboard."""
+    web_dir = Path(__file__).parent / "web"
+    index_file = web_dir / "index.html"
+    if not index_file.exists():
+        return {"error": "Web interface not found"}
+    return FileResponse(index_file)
+
+
+@app.get("/logo.png", include_in_schema=False)
+async def logo():
+    """Serve the logo."""
+    logo_file = Path(__file__).parent.parent.parent / "logo.png"
+    if logo_file.exists():
+        return FileResponse(logo_file)
+    raise HTTPException(status_code=404)
+
+
+@app.get("/api/status")
+async def get_status():
+    """Get daemon and auth status."""
+    global _client, _account_id
+    
+    status = {
+        "connected": _client.is_connected() if _client else False,
+        "authorized": False,
+        "account_id": str(_account_id) if _account_id else None,
+        "user": None
+    }
+    
+    if _client and _client.is_connected() and await _client.is_user_authorized():
+        status["authorized"] = True
+        try:
+            me = await _client.get_me()
+            status["user"] = {
+                "id": me.id,
+                "first_name": me.first_name,
+                "username": me.username,
+                "phone": me.phone
+            }
+        except Exception:
+            pass
+            
+    return status
+
+
+@app.post("/api/auth/send-code")
+async def send_code(req: SendCodeRequest):
+    """Start auth flow by sending code."""
+    global _client, _session, _account_id
+    
+    config: DaemonConfig = app.state.config
+    
+    try:
+        # If no account exists yet, we'll need to create one after sign-in
+        # For now, we use a temporary session or find/create account
+        if not _account_id:
+            # Look for ANY active account or create a default UUID
+            row = await _db_pool.fetchrow("SELECT id FROM telegram_accounts LIMIT 1")
+            if row:
+                _account_id = row["id"]
+            else:
+                from uuid import uuid4
+                _account_id = uuid4()
+                # We'll insert it into DB after successful sign-in
+        
+        if not _session:
+            _session = await init_session(_db_pool, _account_id)
+            
+        if not _client:
+            _client = TelegramClient(
+                session=_session,
+                api_id=config.api_id,
+                api_hash=config.api_hash,
+            )
+            
+        await _client.connect()
+        result = await _client.send_code_request(req.phone)
+        return {"success": True, "phone_code_hash": result.phone_code_hash}
+    except Exception as e:
+        logger.error(f"Error sending code: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/auth/sign-in")
+async def sign_in(req: SignInRequest):
+    """Complete auth flow."""
+    global _client, _account_id, _db_pool
+    
+    if not _client:
+        raise HTTPException(status_code=400, detail="Auth not started")
+        
+    try:
+        if req.password:
+            # 2FA
+            await _client.sign_in(password=req.password)
+        else:
+            # Code
+            await _client.sign_in(req.phone, req.code, phone_code_hash=req.phone_code_hash)
+            
+        # Auth successful! 
+        me = await _client.get_me()
+        
+        # Ensure account exists in DB
+        async with _db_pool.acquire() as conn:
+            # Check if account exists
+            exists = await conn.fetchval("SELECT 1 FROM telegram_accounts WHERE id = $1", _account_id)
+            
+            if not exists:
+                await conn.execute(
+                    \"\"\"
+                    INSERT INTO telegram_accounts (id, name, api_id, api_hash, phone, user_id, username, is_active)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)
+                    \"\"\",
+                    _account_id, "Main", app.state.config.api_id, app.state.config.api_hash,
+                    req.phone, me.id, me.username
+                )
+            else:
+                await conn.execute(
+                    \"\"\"
+                    UPDATE telegram_accounts 
+                    SET user_id = $1, username = $2, phone = $3, last_connected_at = NOW()
+                    WHERE id = $4
+                    \"\"\",
+                    me.id, me.username, req.phone, _account_id
+                )
+        
+        return {"success": True}
+    except errors.SessionPasswordNeededError:
+        return {"success": False, "need_2fa": True}
+    except Exception as e:
+        logger.error(f"Sign in error: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/control/restart")
+async def restart_service():
+    """Restart the daemon by exiting (Docker will restart it)."""
+    logger.info("Restart requested via Web UI")
+    # Schedule exit after response
+    async def shutdown():
+        await asyncio.sleep(1)
+        os.kill(os.getpid(), signal.SIGTERM)
+        
+    asyncio.create_task(shutdown())
+    return {"message": "Restarting..."}
+
+
+# Original Telegram API Endpoints
 @app.get("/health")
 async def health():
     """Health check endpoint."""
-    if _client is None or not _client.is_connected():
-        raise HTTPException(status_code=503, detail="Telegram not connected")
-    return {"status": "healthy", "connected": True}
-
-
-# Account info
-@app.get("/account")
-async def get_account(client: TelegramClient = Depends(get_client)):
-    """Get current account info."""
-    me = await client.get_me()
     return {
-        "id": me.id,
-        "first_name": me.first_name,
-        "last_name": me.last_name,
-        "username": me.username,
-        "phone": me.phone,
+        "status": "ok",
+        "connected": _client.is_connected() if _client else False,
+        "authorized": await _client.is_user_authorized() if _client else False,
     }
 
 
-# Messaging
 @app.post("/send_message")
 async def send_message(
     req: SendMessageRequest, client: TelegramClient = Depends(get_client)
 ):
-    """Send a message to an entity."""
+    \"\"\"Send a message to an entity.\"\"\"
     try:
         entity = await parse_entity(client, req.entity)
-
-        kwargs: dict[str, Any] = {"message": req.message}
+        kwargs = {}
         if req.file_path:
             kwargs["file"] = req.file_path
         if req.reply_to:
             kwargs["reply_to"] = req.reply_to
 
-        result = await client.send_message(entity, **kwargs)
+        result = await client.send_message(entity, req.message, **kwargs)
         return {"success": True, "message_id": result.id}
     except Exception as e:
         logger.error(f"Error sending message: {e}")
@@ -294,7 +446,7 @@ async def send_message(
 async def edit_message(
     req: EditMessageRequest, client: TelegramClient = Depends(get_client)
 ):
-    """Edit a message."""
+    \"\"\"Edit a message.\"\"\"
     try:
         entity = await parse_entity(client, req.entity)
         await client.edit_message(entity, req.message_id, req.message)
@@ -304,11 +456,11 @@ async def edit_message(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/delete_message")
-async def delete_message(
+@app.post("/delete_messages")
+async def delete_messages(
     req: DeleteMessageRequest, client: TelegramClient = Depends(get_client)
 ):
-    """Delete messages."""
+    \"\"\"Delete messages.\"\"\"
     try:
         entity = await parse_entity(client, req.entity)
         await client.delete_messages(entity, req.message_ids)
@@ -322,29 +474,26 @@ async def delete_message(
 async def get_messages(
     req: GetMessagesRequest, client: TelegramClient = Depends(get_client)
 ):
-    """Get messages from an entity."""
+    \"\"\"Get messages from an entity.\"\"\"
     try:
-        from datetime import datetime
-
         entity = await parse_entity(client, req.entity)
+        
+        # Parse dates if provided
+        from datetime import datetime
+        start_date = datetime.fromisoformat(req.start_date) if req.start_date else None
+        end_date = datetime.fromisoformat(req.end_date) if req.end_date else None
 
-        kwargs: dict[str, Any] = {
-            "limit": req.limit,
-            "offset_id": req.offset_id,
-            "reverse": req.reverse,
-        }
-
-        if req.start_date:
-            kwargs["offset_date"] = datetime.fromisoformat(req.start_date)
-        if req.end_date:
-            # Telethon doesn't support end_date directly
-            pass
-
-        messages = await client.get_messages(entity, **kwargs)
+        messages = await client.get_messages(
+            entity,
+            limit=req.limit,
+            offset_id=req.offset_id,
+            reverse=req.reverse,
+            offset_date=end_date,
+        )
 
         result = []
-        for msg in messages:
-            if msg:
+        if messages:
+            for msg in messages:
                 result.append(
                     {
                         "id": msg.id,
@@ -366,7 +515,7 @@ async def get_messages(
 async def search_dialogs(
     req: SearchDialogsRequest, client: TelegramClient = Depends(get_client)
 ):
-    """Search for dialogs."""
+    \"\"\"Search for dialogs.\"\"\"
     try:
         if req.global_search:
             results = await client(req.query, limit=req.limit)
@@ -397,10 +546,9 @@ async def search_dialogs(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Drafts
 @app.post("/get_draft")
 async def get_draft(req: SetDraftRequest, client: TelegramClient = Depends(get_client)):
-    """Get draft for an entity."""
+    \"\"\"Get draft for an entity.\"\"\"
     try:
         entity = await parse_entity(client, req.entity)
         # get_drafts(entity) returns a single custom.Draft object for that entity
@@ -425,22 +573,21 @@ async def get_draft(req: SetDraftRequest, client: TelegramClient = Depends(get_c
 
 @app.post("/set_draft")
 async def set_draft(req: SetDraftRequest, client: TelegramClient = Depends(get_client)):
-    """Set draft for an entity."""
+    \"\"\"Set draft for an entity.\"\"\"
     try:
         entity = await parse_entity(client, req.entity)
-        await client.set_draft(entity, draft=req.message)
+        await client.set_draft(entity, req.message)
         return {"success": True}
     except Exception as e:
         logger.error(f"Error setting draft: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Media
 @app.post("/download_media")
 async def download_media(
     req: DownloadMediaRequest, client: TelegramClient = Depends(get_client)
 ):
-    """Download media from a message."""
+    \"\"\"Download media from a message.\"\"\"
     try:
         entity = await parse_entity(client, req.entity)
         messages = await client.get_messages(entity, ids=req.message_id)
@@ -463,7 +610,7 @@ async def download_media(
 
 @app.post("/message_from_link")
 async def message_from_link(link: str, client: TelegramClient = Depends(get_client)):
-    """Get message from a Telegram link."""
+    \"\"\"Get message from a Telegram link.\"\"\"
     try:
         from mcp_telegram.utils import parse_telegram_url
 
@@ -488,6 +635,6 @@ async def message_from_link(link: str, client: TelegramClient = Depends(get_clie
 
 
 def run_daemon(config: DaemonConfig):
-    """Run the daemon server."""
+    \"\"\"Run the daemon server.\"\"\"
     app.state.config = config
-    uvicorn.run(app, host=config.host, port=config.port, log_level="info")
+    uvicorn.run(app, host=config.host, port=config.port)

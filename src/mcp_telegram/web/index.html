@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MCP Telegram Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background-color: #0f172a; color: #e2e8f0; }
+        .card { background-color: #1e293b; border: 1px solid #334155; }
+        .status-dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+        .bg-success { background-color: #22c55e; }
+        .bg-warning { background-color: #eab308; }
+        .bg-danger { background-color: #ef4444; }
+    </style>
+</head>
+<body class="p-4 md:p-8">
+    <div class="max-w-4xl mx-auto">
+        <header class="flex justify-between items-center mb-8">
+            <div class="flex items-center gap-4">
+                <img src="/logo.png" alt="Logo" class="w-12 h-12 rounded-lg bg-white p-1" onerror="this.style.display='none'">
+                <h1 class="text-2xl font-bold">MCP Telegram <span class="text-blue-400">Dashboard</span></h1>
+            </div>
+            <div id="connection-status" class="flex items-center gap-2 text-sm bg-slate-800 px-3 py-1 rounded-full">
+                <span class="status-dot bg-warning"></span>
+                <span>Checking...</span>
+            </div>
+        </header>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <!-- Status Card -->
+            <div class="card p-6 rounded-xl shadow-lg col-span-1">
+                <h2 class="text-lg font-semibold mb-4 flex items-center gap-2">
+                    🛡️ Account Status
+                </h2>
+                <div id="auth-info" class="space-y-4">
+                    <p class="text-slate-400 italic">Loading status...</p>
+                </div>
+                <div class="mt-6 pt-6 border-t border-slate-700">
+                    <button onclick="handleRestart()" class="w-full bg-slate-700 hover:bg-slate-600 text-white py-2 rounded-lg transition-colors flex items-center justify-center gap-2">
+                        🔄 Restart Service
+                    </button>
+                </div>
+            </div>
+
+            <!-- Auth Form Card -->
+            <div class="card p-6 rounded-xl shadow-lg col-span-1 md:col-span-2">
+                <h2 class="text-lg font-semibold mb-4 flex items-center gap-2">
+                    🔑 Authentication
+                </h2>
+                <div id="auth-form-container">
+                    <p class="text-slate-400">Everything looks good! Your account is authorized.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Logs / Activity -->
+        <div class="mt-8">
+            <h2 class="text-lg font-semibold mb-4 flex items-center gap-2">
+                📝 System Logs
+            </h2>
+            <div id="logs" class="bg-black/50 p-4 rounded-lg font-mono text-xs h-64 overflow-y-auto border border-slate-800">
+                <div class="text-slate-500 italic">Connecting to log stream...</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let authState = { step: 'check', phone: '', phone_hash: '' };
+
+        async function updateStatus() {
+            try {
+                const res = await fetch('/api/status');
+                const status = await res.json();
+                
+                const dot = document.querySelector('#connection-status .status-dot');
+                const text = document.querySelector('#connection-status span:last-child');
+                
+                if (status.connected) {
+                    dot.className = 'status-dot bg-success';
+                    text.innerText = 'Connected';
+                } else {
+                    dot.className = 'status-dot bg-danger';
+                    text.innerText = 'Disconnected';
+                }
+
+                const authInfo = document.getElementById('auth-info');
+                const authForm = document.getElementById('auth-form-container');
+
+                if (status.authorized) {
+                    authInfo.innerHTML = `
+                        <div class="text-sm">
+                            <p class="text-slate-400">User</p>
+                            <p class="font-medium">${status.user?.first_name || 'Authorized'}</p>
+                        </div>
+                        <div class="text-sm">
+                            <p class="text-slate-400">Phone</p>
+                            <p class="font-medium">${status.user?.phone || 'N/A'}</p>
+                        </div>
+                    `;
+                    authForm.innerHTML = '<p class="text-green-400 flex items-center gap-2">✅ Everything is working correctly.</p>';
+                } else {
+                    authInfo.innerHTML = '<p class="text-yellow-400 font-medium">⚠️ Login Required</p>';
+                    if (authState.step === 'check' || authState.step === 'complete') {
+                        showPhoneForm();
+                    }
+                }
+            } catch (e) {
+                console.error('Status check failed', e);
+            }
+        }
+
+        function showPhoneForm() {
+            authState.step = 'phone';
+            const container = document.getElementById('auth-form-container');
+            container.innerHTML = `
+                <div class="space-y-4">
+                    <p class="text-sm text-slate-400">Enter your Telegram phone number to begin.</p>
+                    <input type="text" id="phone-input" placeholder="+79001234567" class="w-full bg-slate-900 border border-slate-700 p-2 rounded text-white outline-none focus:border-blue-500">
+                    <button onclick="sendCode()" id="btn-send-code" class="w-full bg-blue-600 hover:bg-blue-500 py-2 rounded font-medium">Send Code</button>
+                </div>
+            `;
+        }
+
+        async function sendCode() {
+            const phone = document.getElementById('phone-input').value;
+            if (!phone) return alert('Phone required');
+            
+            const btn = document.getElementById('btn-send-code');
+            btn.disabled = true; btn.innerText = 'Sending...';
+
+            try {
+                const res = await fetch('/api/auth/send-code', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ phone })
+                });
+                const data = await res.json();
+                
+                if (data.success) {
+                    authState.phone = phone;
+                    authState.phone_hash = data.phone_code_hash;
+                    showCodeForm();
+                } else {
+                    alert('Error: ' + data.error);
+                    btn.disabled = false; btn.innerText = 'Send Code';
+                }
+            } catch (e) {
+                alert('Request failed');
+                btn.disabled = false;
+            }
+        }
+
+        function showCodeForm() {
+            authState.step = 'code';
+            const container = document.getElementById('auth-form-container');
+            container.innerHTML = `
+                <div class="space-y-4">
+                    <p class="text-sm text-slate-400 text-blue-400">Code sent to your Telegram app!</p>
+                    <input type="text" id="code-input" placeholder="Enter code" class="w-full bg-slate-900 border border-slate-700 p-2 rounded text-white outline-none focus:border-blue-500">
+                    <button onclick="signIn()" id="btn-sign-in" class="w-full bg-blue-600 hover:bg-blue-500 py-2 rounded font-medium">Sign In</button>
+                </div>
+            `;
+        }
+
+        async function signIn() {
+            const code = document.getElementById('code-input').value;
+            const btn = document.getElementById('btn-sign-in');
+            btn.disabled = true;
+
+            try {
+                const res = await fetch('/api/auth/sign-in', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ 
+                        phone: authState.phone,
+                        phone_code_hash: authState.phone_hash,
+                        code: code
+                    })
+                });
+                const data = await res.json();
+                
+                if (data.success) {
+                    authState.step = 'complete';
+                    updateStatus();
+                } else if (data.need_2fa) {
+                    show2FAForm();
+                } else {
+                    alert('Error: ' + data.error);
+                    btn.disabled = false;
+                }
+            } catch (e) {
+                alert('Sign in failed');
+                btn.disabled = false;
+            }
+        }
+
+        function show2FAForm() {
+            authState.step = '2fa';
+            const container = document.getElementById('auth-form-container');
+            container.innerHTML = `
+                <div class="space-y-4">
+                    <p class="text-sm text-slate-400 text-yellow-400">Two-Factor Authentication required.</p>
+                    <input type="password" id="password-input" placeholder="Enter Cloud Password" class="w-full bg-slate-900 border border-slate-700 p-2 rounded text-white outline-none focus:border-blue-500">
+                    <button onclick="signIn2FA()" id="btn-2fa" class="w-full bg-blue-600 hover:bg-blue-500 py-2 rounded font-medium">Submit Password</button>
+                </div>
+            `;
+        }
+
+        async function signIn2FA() {
+            const password = document.getElementById('password-input').value;
+            try {
+                const res = await fetch('/api/auth/sign-in', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ 
+                        phone: authState.phone,
+                        password: password
+                    })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    authState.step = 'complete';
+                    updateStatus();
+                } else {
+                    alert('Error: ' + data.error);
+                }
+            } catch (e) {
+                alert('2FA failed');
+            }
+        }
+
+        async function handleRestart() {
+            if (!confirm('This will restart the Telegram service. Continue?')) return;
+            try {
+                await fetch('/api/control/restart', { method: 'POST' });
+                alert('Restart command sent. The dashboard will reload soon.');
+                setTimeout(() => location.reload(), 3000);
+            } catch (e) {
+                alert('Service is restarting...');
+            }
+        }
+
+        // Auto-refresh status
+        setInterval(updateStatus, 5000);
+        updateStatus();
+
+        // Simple log mock (for now)
+        function appendLog(msg) {
+            const logs = document.getElementById('logs');
+            const div = document.createElement('div');
+            div.className = 'mb-1';
+            div.innerHTML = `<span class="text-slate-500">[${new_datetime()}]</span> ${msg}`;
+            logs.appendChild(div);
+            logs.scrollTop = logs.scrollHeight;
+        }
+        function new_datetime() { return new Date().toLocaleTimeString(); }
+    </script>
+</body>
+</html>
