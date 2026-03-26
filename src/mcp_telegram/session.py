@@ -55,31 +55,23 @@ class PostgresSession(MemorySession):
                     self._takeout_id = row["takeout_id"]
                     self._saved = True
 
-                    # Load entities
+                    # Load entities into MemorySession set
                     entities = await conn.fetch(
                         "SELECT id, hash, username, phone, name FROM entities WHERE account_id = $1",
                         self._account_id,
                     )
                     for e in entities:
-                        self._entities.add((e["id"], e["hash"], e["username"] or "", e["phone"] or "", e["name"] or ""))
+                        # (id, hash, username, phone, name)
+                        self._entities.add((e["id"], e["hash"], e["username"], e["phone"], e["name"]))
         except Exception as e:
             logger.error(f"Failed to initialize session from DB: {e}")
 
-    def set_dc(self, dc_id: int, server_address: str | None, port: int) -> None:
-        super().set_dc(dc_id, server_address, port)
-        self._saved = False
-        self.save()
-
     @property
     def auth_key(self) -> AuthKey | None:
-        # Return AuthKey object as Telethon expects
-        if self._auth_key:
-            return AuthKey(self._auth_key)
-        return None
+        return AuthKey(self._auth_key) if self._auth_key else None
 
     @auth_key.setter
-    def auth_key(self, value: bytes | None) -> None:
-        # Telethon passes AuthKey object, extract bytes from it
+    def auth_key(self, value: Any | None) -> None:
         if hasattr(value, 'key'):
             value = value.key
         if self._auth_key != value:
@@ -88,7 +80,6 @@ class PostgresSession(MemorySession):
             self.save()
 
     def save(self) -> None:
-        """Save session data (fire-and-forget)."""
         if self._saved or self._pool.is_closing():
             return
 
@@ -98,80 +89,86 @@ class PostgresSession(MemorySession):
             self._pending_saves.add(task)
             task.add_done_callback(self._pending_saves.discard)
         except RuntimeError:
-            try:
-                asyncio.run(self._async_save())
-            except Exception:
-                pass
+            pass
         self._saved = True
 
     async def _async_save_tracked(self) -> None:
         try:
             async with self._save_lock:
                 await self._async_save()
-        except Exception as e:
-            if "pool is closing" not in str(e):
-                logger.error(f"Failed to save session: {e}")
+        except Exception:
             self._saved = False
 
     async def _async_save(self) -> None:
         if self._pool.is_closing():
             return
-        try:
-            async with self._pool.acquire() as conn:
-                await conn.execute(
-                    """
-                    INSERT INTO sessions (account_id, dc_id, server_address, port, auth_key, takeout_id, updated_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, NOW())
-                    ON CONFLICT (account_id, dc_id) DO UPDATE SET
-                        server_address = EXCLUDED.server_address,
-                        port = EXCLUDED.port,
-                        auth_key = EXCLUDED.auth_key,
-                        takeout_id = EXCLUDED.takeout_id,
-                        updated_at = NOW()
-                    """,
-                    self._account_id, self._dc_id, self._server_address, self._port, self._auth_key, self._takeout_id
-                )
-        except Exception as e:
-            if "pool is closing" not in str(e):
-                raise e
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO sessions (account_id, dc_id, server_address, port, auth_key, takeout_id, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                ON CONFLICT (account_id, dc_id) DO UPDATE SET
+                    server_address = EXCLUDED.server_address,
+                    port = EXCLUDED.port,
+                    auth_key = EXCLUDED.auth_key,
+                    takeout_id = EXCLUDED.takeout_id,
+                    updated_at = NOW()
+                """,
+                self._account_id, self._dc_id, self._server_address, self._port, self._auth_key, self._takeout_id
+            )
 
     def process_entities(self, tlo: Any, entities: list[Any] | None = None) -> None:
+        # Crucial for Telethon stability
         super().process_entities(tlo)
-        if not entities: return
+        
+        # Collect entities for DB persistence
+        if not entities:
+            return
+            
         rows = []
         for entity in entities:
-            if entity is None: continue  # CRITICAL FIX: skip None entities
+            if entity is None:
+                continue
             try:
+                # Use Telethon's own logic to get ID and Hash
                 eid = utils.get_peer_id(entity)
+                # Not all entities have access_hash (e.g. Chat)
                 ehash = getattr(entity, "access_hash", 0) or 0
-                rows.append((eid, ehash, getattr(entity, "username", None), getattr(entity, "phone", None), utils.get_display_name(entity)))
-            except Exception: continue
+                rows.append((
+                    eid, ehash, 
+                    getattr(entity, "username", None), 
+                    getattr(entity, "phone", None), 
+                    utils.get_display_name(entity)
+                ))
+            except Exception:
+                continue
+                
         if rows and not self._pool.is_closing():
             try:
                 loop = asyncio.get_running_loop()
                 task = loop.create_task(self._async_save_entities(rows))
                 self._pending_saves.add(task)
                 task.add_done_callback(self._pending_saves.discard)
-            except RuntimeError: pass
+            except RuntimeError:
+                pass
 
     async def _async_save_entities(self, rows: list[tuple]) -> None:
-        if self._pool.is_closing(): return
-        try:
-            async with self._pool.acquire() as conn:
-                for eid, ehash, uname, phone, name in rows:
-                    await conn.execute(
-                        """
-                        INSERT INTO entities (account_id, id, hash, username, phone, name, date)
-                        VALUES ($1, $2, $3, $4, $5, $6, EXTRACT(EPOCH FROM NOW())::BIGINT)
-                        ON CONFLICT (account_id, id) DO UPDATE SET
-                            hash = EXCLUDED.hash,
-                            username = COALESCE(EXCLUDED.username, entities.username),
-                            phone = COALESCE(EXCLUDED.phone, entities.phone),
-                            name = COALESCE(EXCLUDED.name, entities.name)
-                        """,
-                        self._account_id, eid, ehash, uname, phone, name
-                    )
-        except Exception: pass
+        if self._pool.is_closing():
+            return
+        async with self._pool.acquire() as conn:
+            for eid, ehash, uname, phone, name in rows:
+                await conn.execute(
+                    """
+                    INSERT INTO entities (account_id, id, hash, username, phone, name, date)
+                    VALUES ($1, $2, $3, $4, $5, $6, EXTRACT(EPOCH FROM NOW())::BIGINT)
+                    ON CONFLICT (account_id, id) DO UPDATE SET
+                        hash = EXCLUDED.hash,
+                        username = COALESCE(EXCLUDED.username, entities.username),
+                        phone = COALESCE(EXCLUDED.phone, entities.phone),
+                        name = COALESCE(EXCLUDED.name, entities.name)
+                    """,
+                    self._account_id, eid, ehash, uname, phone, name
+                )
 
     async def wait_for_pending_saves(self, timeout: float = 2.0) -> None:
         if self._pending_saves:
@@ -179,19 +176,13 @@ class PostgresSession(MemorySession):
             if tasks:
                 await asyncio.wait(tasks, timeout=timeout)
 
-    # Simple file cache
     def cache_file(self, md5: bytes, size: int, inst: Any) -> None:
-        if hasattr(inst, "id"): self._file_cache[(md5, size)] = {"id": inst.id, "hash": inst.hash}
+        if hasattr(inst, "id"): 
+            self._file_cache[(md5, size)] = {"id": inst.id, "hash": inst.hash}
 
     def get_file(self, md5: bytes, size: int, cls: type) -> Any | None:
         cached = self._file_cache.get((md5, size))
         return cls(id=cached["id"], hash=cached["hash"]) if cached else None
-
-    def get_update_state(self, entity_id: int) -> Any | None:
-        return super().get_update_state(entity_id)
-
-    def set_update_state(self, entity_id: int, state: Any) -> None:
-        super().set_update_state(entity_id, state)
 
 
 async def create_session_pool(url: str) -> asyncpg.Pool:

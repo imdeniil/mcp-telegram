@@ -154,12 +154,12 @@ async def daemon_lifespan(app: FastAPI):
     # Check if telegram_accounts table exists, create schema if needed
     try:
         table_exists = await _db_pool.fetchval(
-            \"\"\"
+            """
             SELECT EXISTS (
                 SELECT 1 FROM information_schema.tables
                 WHERE table_name = 'telegram_accounts'
             )
-            \"\"\"
+            """
         )
 
         if not table_exists:
@@ -177,10 +177,10 @@ async def daemon_lifespan(app: FastAPI):
     else:
         # Try to find existing account
         row = await _db_pool.fetchrow(
-            \"\"\"
+            """
             SELECT id FROM telegram_accounts
             WHERE is_active = TRUE ORDER BY created_at LIMIT 1
-            \"\"\"
+            """
         )
         if row:
             _account_id = row["id"]
@@ -206,12 +206,12 @@ async def daemon_lifespan(app: FastAPI):
             try:
                 async with _db_pool.acquire() as conn:
                     await conn.execute(
-                        \"\"\"
+                        """
                         UPDATE telegram_accounts
                         SET user_id = $1, username = $2,
                             last_connected_at = NOW(), updated_at = NOW()
                         WHERE id = $3
-                        \"\"\",
+                        """,
                         me.id,
                         getattr(me, "username", None),
                         _account_id,
@@ -317,18 +317,29 @@ async def send_code(req: SendCodeRequest):
     config: DaemonConfig = app.state.config
     
     try:
-        # If no account exists yet, we'll need to create one after sign-in
-        # For now, we use a temporary session or find/create account
+        # 1. Identify or create account ID
         if not _account_id:
-            # Look for ANY active account or create a default UUID
             row = await _db_pool.fetchrow("SELECT id FROM telegram_accounts LIMIT 1")
             if row:
                 _account_id = row["id"]
             else:
                 from uuid import uuid4
                 _account_id = uuid4()
-                # We'll insert it into DB after successful sign-in
         
+        # 2. CRITICAL: Create placeholder account in DB FIRST
+        # This prevents Foreign Key violations when Telethon tries to save session immediately
+        async with _db_pool.acquire() as conn:
+            exists = await conn.fetchval("SELECT 1 FROM telegram_accounts WHERE id = $1", _account_id)
+            if not exists:
+                await conn.execute(
+                    """
+                    INSERT INTO telegram_accounts (id, name, api_id, api_hash, phone, is_active)
+                    VALUES ($1, $2, $3, $4, $5, TRUE)
+                    """,
+                    _account_id, "Pending Auth", config.api_id, config.api_hash, req.phone
+                )
+
+        # 3. Now initialize session and client
         if not _session:
             _session = await init_session(_db_pool, _account_id)
             
@@ -342,9 +353,10 @@ async def send_code(req: SendCodeRequest):
         await _client.connect()
         result = await _client.send_code_request(req.phone)
         return {"success": True, "phone_code_hash": result.phone_code_hash}
-    except Exception as e:
-        logger.error(f"Error sending code: {e}")
-        return {"success": False, "error": str(e)}
+    except Exception:
+        logger.exception("Error sending code")
+        import traceback
+        return {"success": False, "error": traceback.format_exc()}
 
 
 @app.post("/api/auth/sign-in")
@@ -373,20 +385,20 @@ async def sign_in(req: SignInRequest):
             
             if not exists:
                 await conn.execute(
-                    \"\"\"
+                    """
                     INSERT INTO telegram_accounts (id, name, api_id, api_hash, phone, user_id, username, is_active)
                     VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)
-                    \"\"\",
+                    """,
                     _account_id, "Main", app.state.config.api_id, app.state.config.api_hash,
                     req.phone, me.id, me.username
                 )
             else:
                 await conn.execute(
-                    \"\"\"
+                    """
                     UPDATE telegram_accounts 
                     SET user_id = $1, username = $2, phone = $3, last_connected_at = NOW()
                     WHERE id = $4
-                    \"\"\",
+                    """,
                     me.id, me.username, req.phone, _account_id
                 )
         
@@ -426,7 +438,7 @@ async def health():
 async def send_message(
     req: SendMessageRequest, client: TelegramClient = Depends(get_client)
 ):
-    \"\"\"Send a message to an entity.\"\"\"
+    """Send a message to an entity."""
     try:
         entity = await parse_entity(client, req.entity)
         kwargs = {}
@@ -446,7 +458,7 @@ async def send_message(
 async def edit_message(
     req: EditMessageRequest, client: TelegramClient = Depends(get_client)
 ):
-    \"\"\"Edit a message.\"\"\"
+    """Edit a message."""
     try:
         entity = await parse_entity(client, req.entity)
         await client.edit_message(entity, req.message_id, req.message)
@@ -460,7 +472,7 @@ async def edit_message(
 async def delete_messages(
     req: DeleteMessageRequest, client: TelegramClient = Depends(get_client)
 ):
-    \"\"\"Delete messages.\"\"\"
+    """Delete messages."""
     try:
         entity = await parse_entity(client, req.entity)
         await client.delete_messages(entity, req.message_ids)
@@ -474,7 +486,7 @@ async def delete_messages(
 async def get_messages(
     req: GetMessagesRequest, client: TelegramClient = Depends(get_client)
 ):
-    \"\"\"Get messages from an entity.\"\"\"
+    """Get messages from an entity."""
     try:
         entity = await parse_entity(client, req.entity)
         
@@ -515,7 +527,7 @@ async def get_messages(
 async def search_dialogs(
     req: SearchDialogsRequest, client: TelegramClient = Depends(get_client)
 ):
-    \"\"\"Search for dialogs.\"\"\"
+    """Search for dialogs."""
     try:
         if req.global_search:
             results = await client(req.query, limit=req.limit)
@@ -548,17 +560,14 @@ async def search_dialogs(
 
 @app.post("/get_draft")
 async def get_draft(req: SetDraftRequest, client: TelegramClient = Depends(get_client)):
-    \"\"\"Get draft for an entity.\"\"\"
+    """Get draft for an entity."""
     try:
         entity = await parse_entity(client, req.entity)
-        # get_drafts(entity) returns a single custom.Draft object for that entity
-        # or a list if entity is None. We pass entity to get exactly what we need.
         draft = await client.get_drafts(entity)
 
         if draft and hasattr(draft, "text") and draft.text:
             return {"draft": draft.text}
 
-        # Fallback: if it returned a list, find the matching one
         if isinstance(draft, list) and draft:
             entity_id = get_peer_id(entity)
             for d in draft:
@@ -573,7 +582,7 @@ async def get_draft(req: SetDraftRequest, client: TelegramClient = Depends(get_c
 
 @app.post("/set_draft")
 async def set_draft(req: SetDraftRequest, client: TelegramClient = Depends(get_client)):
-    \"\"\"Set draft for an entity.\"\"\"
+    """Set draft for an entity."""
     try:
         entity = await parse_entity(client, req.entity)
         await client.set_draft(entity, req.message)
@@ -587,7 +596,7 @@ async def set_draft(req: SetDraftRequest, client: TelegramClient = Depends(get_c
 async def download_media(
     req: DownloadMediaRequest, client: TelegramClient = Depends(get_client)
 ):
-    \"\"\"Download media from a message.\"\"\"
+    """Download media from a message."""
     try:
         entity = await parse_entity(client, req.entity)
         messages = await client.get_messages(entity, ids=req.message_id)
@@ -610,7 +619,7 @@ async def download_media(
 
 @app.post("/message_from_link")
 async def message_from_link(link: str, client: TelegramClient = Depends(get_client)):
-    \"\"\"Get message from a Telegram link.\"\"\"
+    """Get message from a Telegram link."""
     try:
         from mcp_telegram.utils import parse_telegram_url
 
@@ -635,6 +644,6 @@ async def message_from_link(link: str, client: TelegramClient = Depends(get_clie
 
 
 def run_daemon(config: DaemonConfig):
-    \"\"\"Run the daemon server.\"\"\"
+    """Run the daemon server."""
     app.state.config = config
     uvicorn.run(app, host=config.host, port=config.port)
