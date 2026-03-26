@@ -177,5 +177,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ---
 
 <div align="center">
-  <p>Made with ❤️ by <a href="https://x.com/dryeab">Yeabsira Driba</a></p>
+  <p>Originally made by <a href="https://x.com/dryeab">Yeabsira Driba</a></p>
+  <p>v0.3.0 enhancements by <a href="https://github.com/imdeniil">imdeniil</a></p>
 </div>
