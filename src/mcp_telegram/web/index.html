@@ -245,16 +245,56 @@
         setInterval(updateStatus, 5000);
         updateStatus();
 
-        // Simple log mock (for now)
-        function appendLog(msg) {
+        // Log streaming via SSE
+        function connectLogStream() {
             const logs = document.getElementById('logs');
-            const div = document.createElement('div');
-            div.className = 'mb-1';
-            div.innerHTML = `<span class="text-slate-500">[${new_datetime()}]</span> ${msg}`;
-            logs.appendChild(div);
-            logs.scrollTop = logs.scrollHeight;
+            logs.innerHTML = ''; // Clear "Connecting..." placeholder
+
+            const LEVEL_COLORS = {
+                'DEBUG': 'text-slate-500',
+                'INFO': 'text-blue-400',
+                'WARNING': 'text-yellow-400',
+                'ERROR': 'text-red-400',
+                'CRITICAL': 'text-red-500 font-bold',
+            };
+            const MAX_LOG_LINES = 500;
+
+            const evtSource = new EventSource('/api/logs/stream');
+
+            evtSource.onmessage = function(event) {
+                try {
+                    const entry = JSON.parse(event.data);
+                    const time = new Date(entry.time).toLocaleTimeString();
+                    const level = entry.level || 'INFO';
+                    const color = LEVEL_COLORS[level] || 'text-slate-300';
+
+                    const div = document.createElement('div');
+                    div.className = 'mb-1';
+                    div.innerHTML = `<span class="text-slate-500">[${time}]</span> <span class="${color}">[${level}]</span> <span class="text-slate-400">${entry.logger}</span> ${entry.message}`;
+                    logs.appendChild(div);
+
+                    // Trim old entries
+                    while (logs.children.length > MAX_LOG_LINES) {
+                        logs.removeChild(logs.firstChild);
+                    }
+                    logs.scrollTop = logs.scrollHeight;
+                } catch (e) {
+                    console.error('Failed to parse log entry', e);
+                }
+            };
+
+            evtSource.onerror = function() {
+                const div = document.createElement('div');
+                div.className = 'mb-1 text-yellow-400';
+                div.textContent = `[${new Date().toLocaleTimeString()}] Reconnecting to log stream...`;
+                logs.appendChild(div);
+                logs.scrollTop = logs.scrollHeight;
+                evtSource.close();
+                setTimeout(connectLogStream, 3000);
+            };
         }
-        function new_datetime() { return new Date().toLocaleTimeString(); }
+
+        connectLogStream();
     </script>
 </body>
 </html>

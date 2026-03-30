@@ -35,25 +35,41 @@ class DaemonClient:
         """Make an HTTP request to the daemon.
 
         Raises:
-            RuntimeError: Not connected to daemon
-            httpx.HTTPStatusError: HTTP error from daemon
-            httpx.RequestError: Connection error
+            RuntimeError: Not connected to daemon or classified error
         """
         if self._client is None:
-            raise RuntimeError("Not connected to daemon. Call connect() first.")
+            raise RuntimeError("[Daemon] Клиент не подключён. Вызовите connect() сначала.")
 
         try:
             response = await self._client.request(method, path, **kwargs)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
-            logger.error(
-                f"Daemon error {e.response.status_code}: {e.response.text[:200]}"
-            )
-            raise
+            # Daemon already classified the error (contains [Telegram] or [Daemon])
+            try:
+                detail = e.response.json().get("detail", e.response.text[:200])
+            except Exception:
+                detail = e.response.text[:200]
+
+            if "[Telegram]" in detail or "[Daemon]" in detail:
+                error_msg = detail
+            else:
+                error_msg = f"[Daemon] {detail}"
+
+            logger.error(f"Daemon error {e.response.status_code}: {error_msg}")
+            raise RuntimeError(error_msg)
+        except httpx.ConnectError:
+            msg = f"[Daemon] Демон недоступен на {self._base_url}. Проверьте, запущен ли контейнер."
+            logger.error(msg)
+            raise RuntimeError(msg)
+        except httpx.TimeoutException:
+            msg = f"[Daemon] Таймаут при обращении к демону ({self._timeout}с)."
+            logger.error(msg)
+            raise RuntimeError(msg)
         except httpx.RequestError as e:
-            logger.error(f"Failed to connect to daemon at {self._base_url}: {e}")
-            raise
+            msg = f"[Daemon] Ошибка сети при обращении к демону: {e}"
+            logger.error(msg)
+            raise RuntimeError(msg)
 
     async def health(self) -> dict[str, Any]:
         """Check daemon health."""

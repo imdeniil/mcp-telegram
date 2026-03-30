@@ -5,6 +5,7 @@ Use this when running multiple terminals - start the daemon once,
 then run this proxy in each terminal.
 """
 
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -14,6 +15,21 @@ from mcp.server.fastmcp import FastMCP
 
 from mcp_telegram.proxy import get_daemon_client
 from mcp_telegram.types import Dialog, DialogType, DownloadedMedia, Message, Messages
+
+logger = logging.getLogger(__name__)
+
+
+def _classify_error(error: Exception, tool_name: str) -> str:
+    """Classify error and add layer context if missing.
+
+    Checks if the error message already contains a layer prefix
+    ([Telegram] or [Daemon]) and passes it through.
+    Otherwise, wraps with [MCP Proxy] prefix.
+    """
+    msg = str(error)
+    if "[Telegram]" in msg or "[Daemon]" in msg:
+        return msg
+    return f"[MCP Proxy] {tool_name}: {msg}"
 
 
 @asynccontextmanager
@@ -107,8 +123,11 @@ async def send_message(
         Success message with the sent message ID.
     """
     client = get_daemon_client()
-    result = await client.send_message(entity, message, file_path, reply_to)
-    return f"Message sent successfully. ID: {result.get('message_id')}"
+    try:
+        result = await client.send_message(entity, message, file_path, reply_to)
+        return f"Message sent successfully. ID: {result.get('message_id')}"
+    except Exception as e:
+        return _classify_error(e, "send_message")
 
 
 @mcp.tool()
@@ -124,8 +143,11 @@ async def edit_message(entity: str, message_id: int, message: str) -> str:
         Success confirmation.
     """
     client = get_daemon_client()
-    await client.edit_message(entity, message_id, message)
-    return "Message edited successfully"
+    try:
+        await client.edit_message(entity, message_id, message)
+        return "Message edited successfully"
+    except Exception as e:
+        return _classify_error(e, "edit_message")
 
 
 @mcp.tool()
@@ -140,8 +162,11 @@ async def delete_message(entity: str, message_ids: list[int]) -> str:
         Success confirmation.
     """
     client = get_daemon_client()
-    await client.delete_message(entity, message_ids)
-    return f"Deleted {len(message_ids)} message(s)"
+    try:
+        await client.delete_message(entity, message_ids)
+        return f"Deleted {len(message_ids)} message(s)"
+    except Exception as e:
+        return _classify_error(e, "delete_message")
 
 
 @mcp.tool()
@@ -159,8 +184,11 @@ async def search_dialogs(
         List of matching dialogs with their details.
     """
     client = get_daemon_client()
-    result = await client.search_dialogs(query, limit, global_search)
-    return _parse_dialogs(result)
+    try:
+        result = await client.search_dialogs(query, limit, global_search)
+        return _parse_dialogs(result)
+    except Exception as e:
+        return _classify_error(e, "search_dialogs")  # type: ignore[return-value]
 
 
 @mcp.tool()
@@ -174,8 +202,11 @@ async def get_draft(entity: str) -> str | None:
         The draft message text, or None if no draft exists.
     """
     client = get_daemon_client()
-    result = await client.get_draft(entity)
-    return result.get("draft")
+    try:
+        result = await client.get_draft(entity)
+        return result.get("draft")
+    except Exception as e:
+        return _classify_error(e, "get_draft")
 
 
 @mcp.tool()
@@ -190,8 +221,11 @@ async def set_draft(entity: str, message: str) -> str:
         Success confirmation.
     """
     client = get_daemon_client()
-    await client.set_draft(entity, message)
-    return "Draft set successfully"
+    try:
+        await client.set_draft(entity, message)
+        return "Draft set successfully"
+    except Exception as e:
+        return _classify_error(e, "set_draft")
 
 
 @mcp.tool()
@@ -217,15 +251,18 @@ async def get_messages(
         List of messages with their details.
     """
     client = get_daemon_client()
-    result = await client.get_messages(
-        entity,
-        limit,
-        start_date.isoformat() if start_date else None,
-        end_date.isoformat() if end_date else None,
-        offset_id,
-        reverse,
-    )
-    return _parse_messages(result)
+    try:
+        result = await client.get_messages(
+            entity,
+            limit,
+            start_date.isoformat() if start_date else None,
+            end_date.isoformat() if end_date else None,
+            offset_id,
+            reverse,
+        )
+        return _parse_messages(result)
+    except Exception as e:
+        return _classify_error(e, "get_messages")  # type: ignore[return-value]
 
 
 @mcp.tool()
@@ -243,8 +280,11 @@ async def media_download(
         Information about the downloaded file.
     """
     client = get_daemon_client()
-    result = await client.download_media(entity, message_id, path)
-    return DownloadedMedia(path=result["path"])
+    try:
+        result = await client.download_media(entity, message_id, path)
+        return DownloadedMedia(path=result["path"])
+    except Exception as e:
+        return _classify_error(e, "media_download")  # type: ignore[return-value]
 
 
 @mcp.tool()
@@ -258,12 +298,15 @@ async def message_from_link(link: str) -> Message:
         The message details.
     """
     client = get_daemon_client()
-    result = await client.message_from_link(link)
-    return Message(
-        id=result["id"],
-        text=result.get("text"),
-        date=datetime.fromisoformat(result["date"]) if result.get("date") else None,
-    )
+    try:
+        result = await client.message_from_link(link)
+        return Message(
+            id=result["id"],
+            text=result.get("text"),
+            date=datetime.fromisoformat(result["date"]) if result.get("date") else None,
+        )
+    except Exception as e:
+        return _classify_error(e, "message_from_link")  # type: ignore[return-value]
 
 
 def run_proxy_server():
