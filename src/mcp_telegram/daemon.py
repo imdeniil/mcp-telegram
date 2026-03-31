@@ -4,18 +4,18 @@ This daemon holds a single Telegram connection and exposes an HTTP API
 for multiple MCP servers to use, solving the SQLite locking issue.
 """
 
+import asyncio
+import json
 import logging
 import os
 import signal
-import asyncio
-import json
 
+from collections import deque
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from uuid import UUID
-from pathlib import Path
-from collections import deque
-from datetime import datetime, timezone
 
 import asyncpg
 import uvicorn
@@ -24,7 +24,8 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
-from telethon import TelegramClient, errors
+from telethon import TelegramClient, errors, hints, types  # type: ignore
+from telethon.tl import functions  # type: ignore
 from telethon.utils import get_peer_id
 
 from mcp_telegram.session import PostgresSession, create_session_pool, init_session
@@ -709,30 +710,50 @@ async def get_messages(
 async def search_dialogs(
     req: SearchDialogsRequest, client: TelegramClient = Depends(get_client)
 ):
-    """Search for dialogs."""
+    """Search for dialogs using Telegram's contacts.search API."""
     try:
+        response = await client(
+            functions.contacts.SearchRequest(
+                q=req.query,
+                limit=req.limit,
+            )
+        )
+
+        assert isinstance(response, types.contacts.Found)
+
+        # Build priority map using marked peer IDs
+        priority: dict[int, int] = {}
+        peers = list(response.my_results)
         if req.global_search:
-            results = await client(req.query, limit=req.limit)
-        else:
-            results = await client.get_dialogs(limit=req.limit)
-            # Filter locally
-            query = req.query.lower()
-            results = [
-                d for d in results if query in (d.name or "").lower()
-            ][: req.limit]
+            peers = peers + list(response.results)
+        for i, peer in enumerate(peers):
+            priority[get_peer_id(peer)] = i
 
         dialogs = []
-        for dialog in results:
-            if hasattr(dialog, "entity"):
-                entity = dialog.entity
-                dialogs.append(
-                    {
-                        "id": entity.id,
-                        "name": getattr(dialog, "name", None),
-                        "username": getattr(entity, "username", None),
-                        "type": type(entity).__name__,
-                    }
-                )
+        for entity in list(response.users) + list(response.chats):
+            if isinstance(entity, hints.Entity):
+                pid = get_peer_id(entity)
+                if pid in priority:
+                    name = getattr(entity, "title", None) or " ".join(
+                        filter(
+                            None,
+                            [
+                                getattr(entity, "first_name", None),
+                                getattr(entity, "last_name", None),
+                            ],
+                        )
+                    ) or None
+                    dialogs.append(
+                        {
+                            "id": pid,
+                            "name": name,
+                            "username": getattr(entity, "username", None),
+                            "type": type(entity).__name__,
+                        }
+                    )
+
+        # Sort by search priority
+        dialogs.sort(key=lambda d: priority.get(d["id"], 999))
 
         return {"dialogs": dialogs}
     except Exception as e:
