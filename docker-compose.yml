@@ -33,7 +33,7 @@ services:
       - DAEMON_HOST=0.0.0.0
       - DAEMON_PORT=${DAEMON_PORT:-8765}
     ports:
-      - "${DAEMON_PORT:-8765}:8765"
+      - "127.0.0.1:${DAEMON_PORT:-8765}:8765"
     volumes:
       - telegram_downloads:/app/downloads
       - ${TG_UPLOAD_DIR:-/tmp}:/app/uploads:ro
