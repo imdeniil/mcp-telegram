@@ -36,6 +36,7 @@ services:
       - "${DAEMON_PORT:-8765}:8765"
     volumes:
       - telegram_downloads:/app/downloads
+      - ${TG_UPLOAD_DIR:-/tmp}:/app/uploads:ro
     restart: unless-stopped
     command: ["mcp-telegram", "daemon"]
 

@@ -114,7 +114,7 @@ class DaemonClient:
         """Delete messages."""
         return await self._request(
             "POST",
-            "/delete_message",
+            "/delete_messages",
             json={"entity": entity, "message_ids": message_ids},
         )
 
