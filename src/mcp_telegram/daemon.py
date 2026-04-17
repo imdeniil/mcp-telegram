@@ -175,6 +175,42 @@ def _handle_telethon_error(error: Exception, action: str) -> HTTPException:
         detail=f"[Daemon] Внутренняя ошибка при «{action}»: {error}",
     )
 
+
+def _serialize_media(media: Any) -> dict[str, Any] | None:
+    """Extract human-checkable fields from a Telethon MessageMedia object."""
+    if media is None:
+        return None
+    info: dict[str, Any] = {"type": type(media).__name__}
+    doc = getattr(media, "document", None)
+    if doc is not None:
+        info["mime_type"] = getattr(doc, "mime_type", None)
+        info["size"] = getattr(doc, "size", None)
+        info["document_id"] = getattr(doc, "id", None)
+        for attr in getattr(doc, "attributes", []) or []:
+            file_name = getattr(attr, "file_name", None)
+            if file_name:
+                info["filename"] = file_name
+                break
+    photo = getattr(media, "photo", None)
+    if photo is not None:
+        info["photo_id"] = getattr(photo, "id", None)
+    return info
+
+
+def _serialize_message(msg: Any) -> dict[str, Any]:
+    """Serialize a Telethon Message into a LLM-verifiable dict."""
+    media_info = _serialize_media(getattr(msg, "media", None))
+    date = getattr(msg, "date", None)
+    return {
+        "id": getattr(msg, "id", None),
+        "date": date.isoformat() if date is not None else None,
+        "text": getattr(msg, "message", "") or "",
+        "has_media": media_info is not None,
+        "media": media_info,
+        "grouped_id": getattr(msg, "grouped_id", None),
+    }
+
+
 # Global state
 _db_pool: asyncpg.Pool | None = None
 _client: TelegramClient | None = None
@@ -631,7 +667,20 @@ async def send_message(
             kwargs["reply_to"] = req.reply_to
 
         result = await client.send_message(entity, req.message, **kwargs)
-        return {"success": True, "message_id": result.id}
+        messages = result if isinstance(result, list) else [result]
+        serialized = [_serialize_message(m) for m in messages]
+        files_expected = len(req.file_path) if req.file_path else 0
+        files_attached = sum(1 for m in serialized if m["has_media"])
+
+        return {
+            "success": True,
+            "message_id": serialized[0]["id"],
+            "message_ids": [m["id"] for m in serialized],
+            "messages": serialized,
+            "files_expected": files_expected,
+            "files_attached": files_attached,
+            "all_files_sent": files_expected == files_attached,
+        }
     except Exception as e:
         logger.error(f"Error sending message: {e}")
         raise _handle_telethon_error(e, "отправка сообщения")
@@ -689,6 +738,7 @@ async def get_messages(
         result = []
         if messages:
             for msg in messages:
+                media_info = _serialize_media(getattr(msg, "media", None))
                 result.append(
                     {
                         "id": msg.id,
@@ -696,6 +746,8 @@ async def get_messages(
                         "date": msg.date.isoformat() if msg.date else None,
                         "from_id": msg.sender_id,
                         "out": msg.out,
+                        "has_media": media_info is not None,
+                        "media": media_info,
                     }
                 )
 

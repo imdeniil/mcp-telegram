@@ -125,7 +125,28 @@ async def send_message(
     client = get_daemon_client()
     try:
         result = await client.send_message(entity, message, file_path, reply_to)
-        return f"Message sent successfully. ID: {result.get('message_id')}"
+        msg_ids = result.get("message_ids") or [result.get("message_id")]
+        expected = result.get("files_expected", 0)
+        attached = result.get("files_attached", 0)
+        lines = [f"Message sent. IDs: {msg_ids}"]
+        if expected > 0:
+            if result.get("all_files_sent"):
+                lines.append(f"Files attached: {attached}/{expected} OK")
+            else:
+                lines.append(f"WARNING: Files attached: {attached}/{expected} — NOT ALL ATTACHED")
+            for m in result.get("messages", []):
+                media = m.get("media")
+                if media:
+                    fname = media.get("filename") or media.get("type", "?")
+                    size = media.get("size")
+                    mime = media.get("mime_type")
+                    parts = [str(fname)]
+                    if size is not None:
+                        parts.append(f"{size} bytes")
+                    if mime:
+                        parts.append(str(mime))
+                    lines.append(f"  - msg_id={m.get('id')}: {', '.join(parts)}")
+        return "\n".join(lines)
     except Exception as e:
         return _classify_error(e, "send_message")
 
