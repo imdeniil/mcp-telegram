@@ -14,7 +14,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from mcp_telegram.proxy import get_daemon_client
-from mcp_telegram.types import Dialog, DialogType, DownloadedMedia, Message, Messages
+from mcp_telegram.types import Dialog, DialogType, DownloadedMedia, Media, Message, Messages
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +83,21 @@ def _parse_dialogs(data: dict[str, Any]) -> list[Dialog]:
     return dialogs
 
 
+def _parse_media(raw: dict[str, Any] | None) -> Media | None:
+    """Map the daemon media dict into the Media model."""
+    if not raw:
+        return None
+    media_id = raw.get("document_id") or raw.get("photo_id")
+    if media_id is None:
+        return None
+    return Media(
+        media_id=media_id,
+        mime_type=raw.get("mime_type"),
+        file_name=raw.get("filename"),
+        file_size=raw.get("size"),
+    )
+
+
 def _parse_messages(data: dict[str, Any]) -> Messages:
     """Parse messages from daemon response."""
     messages = []
@@ -94,7 +109,7 @@ def _parse_messages(data: dict[str, Any]) -> Messages:
                 message=m.get("text"),
                 outgoing=m.get("out", False),
                 date=datetime.fromisoformat(m["date"]) if m.get("date") else None,
-                media=None,  # Not returned by daemon currently
+                media=_parse_media(m.get("media")),
                 reply_to=m.get("reply_to"),
             )
         )
