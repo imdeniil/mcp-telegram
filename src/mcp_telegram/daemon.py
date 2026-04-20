@@ -662,7 +662,18 @@ async def send_message(
         entity = parse_entity(req.entity)
         kwargs = {}
         if req.file_path:
-            kwargs["file"] = req.file_path
+            upload_dir = os.environ.get("UPLOAD_DIR", "/app/uploads")
+            mapped = []
+            for fp in req.file_path:
+                if os.path.isfile(fp):
+                    mapped.append(fp)
+                else:
+                    container_path = os.path.join(upload_dir, os.path.basename(fp))
+                    if os.path.isfile(container_path):
+                        mapped.append(container_path)
+                    else:
+                        mapped.append(fp)
+            kwargs["file"] = mapped
         if req.reply_to:
             kwargs["reply_to"] = req.reply_to
 
