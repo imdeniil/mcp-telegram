@@ -8,17 +8,16 @@ safely exposed behind a reverse proxy on a public host.
 import logging
 import os
 
-from typing import Any
+from typing import Any, cast
 
+import httpx
 import uvicorn
 
 from mcp.server.fastmcp import FastMCP
 
 # Host validation exists in mcp >= 1.7; older versions don't have it.
 try:
-    from mcp.server.transport_security import (
-        TransportSecuritySettings,  # type: ignore[import-not-found]
-    )
+    from mcp.server.transport_security import TransportSecuritySettings  # type: ignore
 except ImportError:
     TransportSecuritySettings = None  # type: ignore[assignment,misc]
 
@@ -60,33 +59,145 @@ def _configure_host_validation(mcp: FastMCP) -> None:
         )
 
 
-class BearerAuthMiddleware:
-    """Minimal ASGI middleware enforcing ``Authorization: Bearer <token>``.
+class TokenAuthMiddleware:
+    """ASGI auth requiring a shared token, browser-friendly.
 
-    Wraps any ASGI app (FastMCP's Starlette app). Non-HTTP scopes (e.g. the
-    lifespan startup) are passed through. HTTP/websocket requests without a
-    matching bearer token get a 401 / websocket close.
+    Accepts any of:
+      - ``Authorization: Bearer <token>`` header (programmatic clients).
+      - a cookie (so the web dashboard works after a one-time ?token= open).
+      - ``?token=<token>`` query param, which additionally sets the cookie on
+        the response (bookmark ``https://host/?token=…`` once).
+    Non-HTTP scopes (lifespan) are passed through.
     """
 
-    def __init__(self, app: Any, token: str) -> None:
+    def __init__(self, app: Any, token: str, cookie_name: str = "mcp_token") -> None:
         self.app = app
-        self._expected = f"Bearer {token}"
+        self.token = token
+        self.cookie = cookie_name
+        self._cookie_match = f"{cookie_name}={token}".encode()
+        self._bearer = f"Bearer {token}".encode()
+        self._query = f"token={token}".encode()
+        self._set_cookie = (
+            f"{cookie_name}={token}; Path=/; HttpOnly; SameSite=Lax; "
+            f"Max-Age=2592000"
+        ).encode()
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope.get("type") in ("http", "websocket"):
             headers: list[tuple[bytes, bytes]] = list(scope.get("headers") or [])  # type: ignore[arg-type]
-            auth = ""
+            bearer_ok = cookie_ok = False
             for name, value in headers:
-                if name == b"authorization":
-                    auth = value.decode("latin-1")
-                    break
-            if auth != self._expected:
+                if name == b"authorization" and value == self._bearer:
+                    bearer_ok = True
+                elif name == b"cookie" and self._cookie_match in value:
+                    cookie_ok = True
+            query_ok = self._query in (scope.get("query_string") or b"")
+            if not (bearer_ok or cookie_ok or query_ok):
                 if scope["type"] == "http":
                     await _send_unauthorized(send)
                 else:
                     await send({"type": "websocket.close", "code": 1008})
                 return
+            # Set the cookie when the caller proves knowledge via ?token=.
+            if query_ok and scope["type"] == "http":
+                send = self._wrap_send_with_cookie(send)  # type: ignore[assignment]
         await self.app(scope, receive, send)
+
+    def _wrap_send_with_cookie(self, send: Any) -> Any:
+        target = self
+
+        async def wrapped(message: Any) -> None:
+            if message.get("type") == "http.response.start":
+                headers = list(message.get("headers") or [])
+                headers.append((b"set-cookie", target._set_cookie))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        return wrapped
+
+
+class ReverseProxy:
+    """ASGI reverse-proxy that streams HTTP requests to a target base URL."""
+
+    _HOP = {
+        b"connection",
+        b"keep-alive",
+        b"proxy-authenticate",
+        b"proxy-authorization",
+        b"te",
+        b"trailer",
+        b"trailers",
+        b"transfer-encoding",
+        b"upgrade",
+    }
+
+    def __init__(self, target_url: str) -> None:
+        self.target = target_url.rstrip("/")
+        self.client = httpx.AsyncClient(timeout=httpx.Timeout(timeout=300.0))
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            return  # only HTTP is proxied
+        method = scope["method"]
+        path = scope.get("path", "") or "/"
+        qs = scope.get("query_string") or b""
+        url = self.target + path + (b"?" + qs if qs else b"")  # type: ignore[operator]
+        raw_headers: list[tuple[bytes, bytes]] = list(scope.get("headers") or [])  # type: ignore[arg-type]
+        headers = [
+            (k, v)
+            for k, v in raw_headers
+            if k.lower() not in self._HOP and k.lower() != b"host"
+        ]
+        body = b""
+        while True:
+            msg = await receive()
+            if msg.get("type") == "http.request":
+                body += msg.get("body") or b""
+                if not msg.get("more_body"):
+                    break
+        resp = None
+        try:
+            req = self.client.build_request(method, url, headers=headers, content=body)  # type: ignore[arg-type]
+            resp = await self.client.send(req, stream=True)
+            out_headers = [
+                (k, v)
+                for k, v in resp.headers.raw
+                if k.lower() not in self._HOP
+                and k.lower() not in (b"content-length", b"content-encoding")
+            ]
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": resp.status_code,
+                    "headers": out_headers,
+                }
+            )
+            async for chunk in resp.aiter_raw():
+                await send(
+                    {"type": "http.response.body", "body": chunk, "more_body": True}
+                )
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+        except Exception as e:
+            logger.warning(f"reverse-proxy error to {url}: {e}")
+            await _send_bad_gateway(send)
+        finally:
+            if resp is not None:
+                await resp.aclose()
+
+
+class RouterApp:
+    """Route /sse and /messages/* to the MCP app; everything else to a proxy."""
+
+    def __init__(self, sse_app: Any, proxy: Any) -> None:
+        self.sse = sse_app
+        self.proxy = proxy
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        path = scope.get("path", "") or ""
+        if path == "/sse" or path.startswith("/messages"):
+            await self.sse(scope, receive, send)
+        else:
+            await self.proxy(scope, receive, send)
 
 
 async def _send_unauthorized(send: Any) -> None:
@@ -105,12 +216,26 @@ async def _send_unauthorized(send: Any) -> None:
     )
 
 
+async def _send_bad_gateway(send: Any) -> None:
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 502,
+            "headers": [[b"content-type", b"application/json"]],
+        }
+    )
+    await send(
+        {"type": "http.response.body", "body": b'{"detail":"bad gateway"}'}
+    )
+
+
 def run_mcp_server(
     mcp: FastMCP,
     transport: str = "stdio",
     host: str = "0.0.0.0",
     port: int = 8766,
     auth_token: str | None = None,
+    daemon_url: str | None = None,
 ) -> None:
     """Run a FastMCP server on the given transport.
 
@@ -119,8 +244,13 @@ def run_mcp_server(
         transport (`str`): ``stdio`` (default), ``sse``, or ``streamable-http``.
         host (`str`): Bind address for HTTP transports. Ignored for stdio.
         port (`int`): Bind port for HTTP transports. Ignored for stdio.
-        auth_token (`str | None`, optional): If set, HTTP transports require an
-            ``Authorization: Bearer <auth_token>`` header. Ignored for stdio.
+        auth_token (`str | None`, optional): If set, HTTP requests require the
+            token (``Authorization: Bearer <token>`` header, a cookie, or
+            ``?token=``). Strongly recommended for public exposure.
+        daemon_url (`str | None`, optional): If set, non-MCP paths (``/``,
+            ``/api/*``, ``/health`` …) are reverse-proxied to this daemon URL,
+            turning the server into a single public gateway that also serves the
+            web dashboard. Ignored for stdio.
 
     Raises:
         `ValueError`: If ``transport`` is not one of the supported values.
@@ -133,19 +263,25 @@ def run_mcp_server(
 
     if transport == "sse":
         _configure_host_validation(mcp)
-        app: Any = mcp.sse_app()  # type: ignore[assignment]
+        mcp_app: Any = cast(Any, mcp.sse_app())  # type: ignore
     elif transport == "streamable-http":
         _configure_host_validation(mcp)
-        app = mcp.streamable_http_app()  # type: ignore[assignment]
+        mcp_app = cast(Any, mcp.streamable_http_app())  # type: ignore
     else:
         raise ValueError(
             f"Unsupported transport {transport!r}; "
             "use one of: stdio, sse, streamable-http."
         )
 
+    if daemon_url:
+        app: Any = RouterApp(mcp_app, ReverseProxy(daemon_url))
+        logger.info("Dashboard reverse-proxy -> %s enabled", daemon_url)
+    else:
+        app = mcp_app
+
     if auth_token:
-        app = BearerAuthMiddleware(app, auth_token)
-        logger.info("MCP HTTP auth enabled (Bearer token required)")
+        app = TokenAuthMiddleware(app, auth_token)
+        logger.info("MCP HTTP auth enabled (Bearer header / cookie)")
     else:
         logger.warning(
             "Starting MCP HTTP server WITHOUT auth. Set MCP_AUTH_TOKEN before "
@@ -158,4 +294,4 @@ def run_mcp_server(
         host,
         port,
     )
-    uvicorn.run(app, host=host, port=port)  # type: ignore[arg-type]
+    uvicorn.run(app, host=host, port=port)  # type: ignore

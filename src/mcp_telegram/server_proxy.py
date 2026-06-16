@@ -6,6 +6,7 @@ then run this proxy in each terminal.
 """
 
 import logging
+import os
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -613,7 +614,16 @@ def run_proxy_server(
     port: int = 8766,
     auth_token: str | None = None,
 ) -> None:
-    """Run the MCP proxy server (daemon-backed) on the given transport."""
+    """Run the MCP proxy server (daemon-backed) on the given transport.
+
+    In HTTP mode, also reverse-proxies the daemon's web dashboard/API
+    (``DAEMON_URL``) so the public gateway serves both MCP and the dashboard.
+    """
     run_mcp_server(
-        mcp, transport=transport, host=host, port=port, auth_token=auth_token
+        mcp,
+        transport=transport,
+        host=host,
+        port=port,
+        auth_token=auth_token,
+        daemon_url=os.environ.get("DAEMON_URL"),
     )
