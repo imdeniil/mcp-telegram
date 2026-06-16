@@ -327,6 +327,97 @@ def start(
 
 
 @app.command()
+def connect(
+    url: str = typer.Option(
+        ...,
+        "--url",
+        envvar="MCP_SERVER_URL",
+        help="Server base URL, e.g. https://mcp.example.com",
+    ),
+    token: str = typer.Option(
+        ...,
+        "--token",
+        envvar="MCP_AUTH_TOKEN",
+        help="Bearer token (prefer the env var to keep it out of shell history)",
+    ),
+    transport: str = typer.Option(
+        "sse", "--transport", "-t", help="sse (default) or streamable-http"
+    ),
+    name: str = typer.Option(
+        "telegram", "--name", help="MCP server name in the client config"
+    ),
+    scope: str = typer.Option(
+        "user", "--scope", help="local | project | user (claude mcp add scope)"
+    ),
+) -> None:
+    """Print ready-to-use config to connect Claude Code to a remote server.
+
+    The server must be running with an HTTP transport (sse or streamable-http)
+    and the same MCP_AUTH_TOKEN. Prints the `claude mcp add` one-liner and the
+    JSON block to paste into ~/.claude.json (scope=user) or .mcp.json
+    (scope=project).
+    """
+    transport = (transport or "sse").lower()
+    if transport == "sse":
+        endpoint = url.rstrip("/") + "/sse"
+        claude_transport = "sse"
+        json_type = "sse"
+    elif transport in ("streamable-http", "http"):
+        endpoint = url.rstrip("/") + "/mcp"
+        claude_transport = "http"
+        json_type = "http"
+    else:
+        console.print(
+            f"[red]Unsupported transport:[/red] {transport}. "
+            "Use sse or streamable-http."
+        )
+        raise typer.Exit(1)
+
+    if scope not in ("local", "project", "user"):
+        console.print(
+            f"[red]Invalid scope:[/red] {scope}. Use local, project, or user."
+        )
+        raise typer.Exit(1)
+
+    add_cmd = (
+        f'claude mcp add --transport {claude_transport} --scope {scope} '
+        f"{name} {endpoint} --header \"Authorization: Bearer {token}\""
+    )
+    json_block = (
+        "{\n"
+        '  "mcpServers": {\n'
+        f'    "{name}": {{\n'
+        f'      "type": "{json_type}",\n'
+        f'      "url": "{endpoint}",\n'
+        f'      "headers": {{ "Authorization": "Bearer {token}" }}\n'
+        f"    }}\n"
+        "  }\n"
+        "}"
+    )
+
+    console.print(
+        Panel.fit(
+            "[bold green]Connect Claude Code to mcp-telegram[/bold green]\n\n"
+            f"[dim]Transport:[/dim] {transport}\n"
+            f"[dim]Endpoint:[/dim] {endpoint}\n",
+            title="🔌 Connect",
+            border_style="green",
+        )
+    )
+    console.print("\n[bold]1) One-liner (Claude Code CLI):[/bold]")
+    console.print(f"[cyan]{add_cmd}[/cyan]")
+    console.print(
+        "\n[bold]2) Or paste into a config file[/bold] "
+        "[dim](~/.claude.json for scope=user, .mcp.json for scope=project):[/dim]"
+    )
+    console.print(f"[cyan]{json_block}[/cyan]")
+    console.print(
+        "\n[dim]The Bearer header is sent on both the stream and the JSON-RPC "
+        "POSTs, gating the whole session.[/dim]"
+    )
+
+
+@app.command()
 def daemon(
     host: str = typer.Option("0.0.0.0", "--host", "-h", help="Host to bind to"),
     port: int = typer.Option(8765, "--port", "-p", help="Port to listen on"),

@@ -117,6 +117,42 @@ Add the following to your `claude_desktop_config.json` or Cursor settings:
 
 ---
 
+## 🖥️ Connecting Claude Code to a remote server
+
+Claude Code (and other HTTP-capable MCP clients) can talk to a server-side
+mcp-telegram over HTTP. First run the MCP on your server (see
+[Connecting to Dify](#-connecting-to-dify-http-transport) for server setup),
+then generate the client config:
+
+```bash
+mcp-telegram connect --url https://mcp.example.com --token "$MCP_AUTH_TOKEN"
+```
+
+It prints a ready-to-use one-liner and a JSON block:
+
+```bash
+claude mcp add --transport sse --scope user telegram https://mcp.example.com/sse \
+  --header "Authorization: Bearer <MCP_AUTH_TOKEN>"
+```
+
+```json
+{
+  "mcpServers": {
+    "telegram": {
+      "type": "sse",
+      "url": "https://mcp.example.com/sse",
+      "headers": { "Authorization": "Bearer <MCP_AUTH_TOKEN>" }
+    }
+  }
+}
+```
+
+Paste the JSON into `~/.claude.json` (`--scope user`) or `.mcp.json`
+(`--scope project`). For streamable-http, pass `--transport streamable-http`
+(endpoint `/mcp`). The Bearer header is sent on both the stream and the
+JSON-RPC POSTs, so the token gates the whole session. Prefer `--token` via the
+`MCP_AUTH_TOKEN` env var to keep the secret out of shell history.
+
 ## 🌐 Connecting to Dify (HTTP Transport)
 
 Dify supports MCP only over HTTP (SSE or Streamable HTTP), not stdio. Run the
