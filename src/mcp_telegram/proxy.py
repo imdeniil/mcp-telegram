@@ -151,6 +151,27 @@ class DaemonClient:
             json={"query": query, "limit": limit, "global_search": global_search},
         )
 
+    async def export_messages(
+        self,
+        entities: list[str | int] | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        per_chat_limit: int = 100,
+        max_chats: int = 30,
+    ) -> dict[str, Any]:
+        """Export messages across chats for a date window."""
+        return await self._request(
+            "POST",
+            "/export_messages",
+            json={
+                "entities": entities,
+                "start_date": start_date,
+                "end_date": end_date,
+                "per_chat_limit": per_chat_limit,
+                "max_chats": max_chats,
+            },
+        )
+
     async def get_draft(self, entity: str | int) -> dict[str, Any]:
         """Get draft."""
         return await self._request(

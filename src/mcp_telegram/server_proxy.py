@@ -14,7 +14,17 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from mcp_telegram.proxy import get_daemon_client
-from mcp_telegram.types import Dialog, DialogType, DownloadedMedia, Media, Message, Messages
+from mcp_telegram.types import (
+    DATE_INPUT_GUIDE,
+    ChatMessages,
+    Dialog,
+    DialogType,
+    DownloadedMedia,
+    ExportResult,
+    Media,
+    Message,
+    Messages,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,34 +63,39 @@ mcp = FastMCP(
 )
 
 
+@mcp.resource(
+    "docs://date-formats",
+    name="date-formats",
+    description="How to enter dates for date-filtered tools (get_messages, export_messages).",
+)
+def date_formats() -> str:
+    """Date input guide for date-filtered tools."""
+    return DATE_INPUT_GUIDE
+
+
+def _parse_dialog(d: dict[str, Any]) -> Dialog:
+    """Parse a single dialog dict from a daemon response."""
+    dialog_type = str(d.get("type", "user")).lower()
+    type_map = {
+        "user": DialogType.USER,
+        "group": DialogType.GROUP,
+        "channel": DialogType.CHANNEL,
+        "bot": DialogType.BOT,
+    }
+    return Dialog(
+        id=d["id"],
+        title=d.get("name") or d.get("title") or "Unknown",
+        username=d.get("username"),
+        phone_number=d.get("phone_number") or d.get("phone"),
+        type=type_map.get(dialog_type, DialogType.USER),
+        unread_messages_count=d.get("unread_messages_count", 0),
+        can_send_message=d.get("can_send_message", True),
+    )
+
+
 def _parse_dialogs(data: dict[str, Any]) -> list[Dialog]:
     """Parse dialogs from daemon response."""
-    dialogs = []
-    for d in data.get("dialogs", []):
-        # Map daemon response to Dialog type
-        dialog_type = d.get("type", "user").lower()
-        type_map = {
-            "user": DialogType.USER,
-            "group": DialogType.GROUP,
-            "channel": DialogType.CHANNEL,
-            "bot": DialogType.BOT,
-            "User": DialogType.USER,
-            "Group": DialogType.GROUP,
-            "Channel": DialogType.CHANNEL,
-        }
-
-        dialogs.append(
-            Dialog(
-                id=d["id"],
-                title=d.get("name") or d.get("title") or "Unknown",
-                username=d.get("username"),
-                phone_number=d.get("phone_number") or d.get("phone"),
-                type=type_map.get(dialog_type, DialogType.USER),
-                unread_messages_count=d.get("unread_messages_count", 0),
-                can_send_message=d.get("can_send_message", True),
-            )
-        )
-    return dialogs
+    return [_parse_dialog(d) for d in data.get("dialogs", [])]
 
 
 def _parse_media(raw: dict[str, Any] | None) -> Media | None:
@@ -113,7 +128,38 @@ def _parse_messages(data: dict[str, Any]) -> Messages:
                 reply_to=m.get("reply_to"),
             )
         )
-    return Messages(messages=messages, dialog=None)
+    return Messages(
+        messages=messages,
+        dialog=None,
+        next_offset_id=data.get("next_offset_id"),
+        has_more=bool(data.get("has_more", False)),
+    )
+
+
+def _parse_export(data: dict[str, Any]) -> ExportResult:
+    """Parse a cross-chat export response from the daemon."""
+    results: list[ChatMessages] = []
+    for entry in data.get("results", []):
+        dialog = _parse_dialog(entry.get("dialog") or {})
+        raw_msgs = entry.get("messages", [])
+        messages = [
+            Message(
+                message_id=m["id"],
+                sender_id=m.get("from_id"),
+                message=m.get("text"),
+                outgoing=m.get("out", False),
+                date=datetime.fromisoformat(m["date"]) if m.get("date") else None,
+                media=_parse_media(m.get("media")),
+                reply_to=m.get("reply_to"),
+            )
+            for m in raw_msgs
+        ]
+        results.append(ChatMessages(dialog=dialog, messages=messages))
+    return ExportResult(
+        results=results,
+        chats_processed=data.get("chats_processed", len(results)),
+        truncated=bool(data.get("truncated", False)),
+    )
 
 
 @mcp.tool()
@@ -299,6 +345,47 @@ async def get_messages(
         return _parse_messages(result)
     except Exception as e:
         return _classify_error(e, "get_messages")  # type: ignore[return-value]
+
+
+@mcp.tool()
+async def export_messages(
+    entities: list[str | int] | None = None,
+    start_date: datetime | None = None,
+    end_date: datetime | None = None,
+    per_chat_limit: int = 100,
+    max_chats: int = 30,
+) -> ExportResult:
+    """Export messages across multiple chats for a date window.
+
+    Provide `entities` to export specific chats, or leave it None to export the
+    most recent chats (up to `max_chats`). Each chat returns up to
+    `per_chat_limit` messages; page individual chats further via `get_messages`
+    with the `offset_id` cursor.
+
+    Args:
+        entities: Chat identifiers to export. None = recent dialogs (max_chats).
+        start_date: Start of the window (required for a bounded export).
+        end_date: End of the window. Defaults to now.
+        per_chat_limit: Max messages per chat (1..500). Default 100.
+        max_chats: Max chats when entities is None (1..100). Default 30.
+
+    Returns:
+        Per-chat message batches with a truncation flag.
+    """
+    if start_date is None:
+        return _classify_error(ValueError("start_date is required"), "export_messages")  # type: ignore[return-value]
+    client = get_daemon_client()
+    try:
+        result = await client.export_messages(
+            entities,
+            start_date.isoformat(),
+            end_date.isoformat() if end_date else None,
+            per_chat_limit,
+            max_chats,
+        )
+        return _parse_export(result)
+    except Exception as e:
+        return _classify_error(e, "export_messages")  # type: ignore[return-value]
 
 
 @mcp.tool()
