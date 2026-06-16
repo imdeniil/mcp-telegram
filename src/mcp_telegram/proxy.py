@@ -31,45 +31,76 @@ class DaemonClient:
             await self._client.aclose()
             self._client = None
 
+    async def _reset_client(self) -> None:
+        """Close and discard the current client after a broken connection."""
+        if self._client is not None:
+            try:
+                await self._client.aclose()
+            except Exception:
+                pass
+            self._client = None
+
     async def _request(self, method: str, path: str, **kwargs) -> dict[str, Any]:
         """Make an HTTP request to the daemon.
 
+        Auto-connects if the client is not initialized, and reconnects once on
+        a broken connection (e.g. the daemon restarted mid-request), so daemon
+        restarts no longer require an mcp-server restart.
+
         Raises:
-            RuntimeError: Not connected to daemon or classified error
+            RuntimeError: Classified daemon/network error.
         """
-        if self._client is None:
-            raise RuntimeError("[Daemon] Клиент не подключён. Вызовите connect() сначала.")
+        # Connection-level errors -> recreate the client and retry once.
+        connection_errors = (
+            httpx.ConnectError,
+            httpx.RemoteProtocolError,
+            httpx.ReadError,
+            httpx.WriteError,
+        )
 
-        try:
-            response = await self._client.request(method, path, **kwargs)
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPStatusError as e:
-            # Daemon already classified the error (contains [Telegram] or [Daemon])
+        for attempt in range(2):
+            if self._client is None:
+                await self.connect()
+            assert self._client is not None  # connected above
+
             try:
-                detail = e.response.json().get("detail", e.response.text[:200])
-            except Exception:
-                detail = e.response.text[:200]
+                response = await self._client.request(method, path, **kwargs)
+                response.raise_for_status()
+                return response.json()
+            except connection_errors as e:
+                if attempt == 0:
+                    logger.warning(
+                        f"Daemon connection lost ({type(e).__name__}); reconnecting..."
+                    )
+                    await self._reset_client()
+                    continue
+                msg = f"[Daemon] Демон недоступен на {self._base_url} после переподключения: {e}"
+                logger.error(msg)
+                raise RuntimeError(msg)
+            except httpx.HTTPStatusError as e:
+                # Daemon already classified the error (contains [Telegram]/[Daemon])
+                try:
+                    detail = e.response.json().get("detail", e.response.text[:200])
+                except Exception:
+                    detail = e.response.text[:200]
 
-            if "[Telegram]" in detail or "[Daemon]" in detail:
-                error_msg = detail
-            else:
-                error_msg = f"[Daemon] {detail}"
+                if "[Telegram]" in detail or "[Daemon]" in detail:
+                    error_msg = detail
+                else:
+                    error_msg = f"[Daemon] {detail}"
 
-            logger.error(f"Daemon error {e.response.status_code}: {error_msg}")
-            raise RuntimeError(error_msg)
-        except httpx.ConnectError:
-            msg = f"[Daemon] Демон недоступен на {self._base_url}. Проверьте, запущен ли контейнер."
-            logger.error(msg)
-            raise RuntimeError(msg)
-        except httpx.TimeoutException:
-            msg = f"[Daemon] Таймаут при обращении к демону ({self._timeout}с)."
-            logger.error(msg)
-            raise RuntimeError(msg)
-        except httpx.RequestError as e:
-            msg = f"[Daemon] Ошибка сети при обращении к демону: {e}"
-            logger.error(msg)
-            raise RuntimeError(msg)
+                logger.error(f"Daemon error {e.response.status_code}: {error_msg}")
+                raise RuntimeError(error_msg)
+            except httpx.TimeoutException:
+                msg = f"[Daemon] Таймаут при обращении к демону ({self._timeout}с)."
+                logger.error(msg)
+                raise RuntimeError(msg)
+            except httpx.RequestError as e:
+                msg = f"[Daemon] Ошибка сети при обращении к демону: {e}"
+                logger.error(msg)
+                raise RuntimeError(msg)
+
+        raise RuntimeError("[Daemon] Запрос не выполнен после переподключения.")
 
     async def health(self) -> dict[str, Any]:
         """Check daemon health."""
