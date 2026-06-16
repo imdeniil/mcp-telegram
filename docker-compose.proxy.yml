@@ -1,0 +1,25 @@
+# Deployment overlay for nginxproxy/nginx-proxy + acme-companion.
+#
+# Puts the mcp-server on the shared `proxy` network and registers it with the
+# reverse proxy (auto-TLS via LETSENCRYPT_HOST). The base docker-compose.yml
+# stays usable for local dev; apply this overlay only on the server:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.proxy.yml up -d --build
+#
+# Required .env: MCP_VIRTUAL_HOST, LETSENCRYPT_EMAIL, MCP_AUTH_TOKEN,
+# MCP_ALLOWED_HOSTS (set to the virtual host, e.g. tg.keemor.su:*).
+
+services:
+  mcp-server:
+    environment:
+      - VIRTUAL_HOST=${MCP_VIRTUAL_HOST:?set MCP_VIRTUAL_HOST, e.g. tg.keemor.su}
+      - VIRTUAL_PORT=${MCP_PORT:-8766}
+      - LETSENCRYPT_HOST=${MCP_VIRTUAL_HOST:?set MCP_VIRTUAL_HOST}
+      - LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL:?set LETSENCRYPT_EMAIL}
+    networks:
+      default: {}
+      proxy: {}
+
+networks:
+  proxy:
+    external: true
