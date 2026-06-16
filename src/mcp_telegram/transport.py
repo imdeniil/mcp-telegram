@@ -140,8 +140,8 @@ class ReverseProxy:
             return  # only HTTP is proxied
         method = scope["method"]
         path = scope.get("path", "") or "/"
-        qs = scope.get("query_string") or b""
-        url = self.target + path + (b"?" + qs if qs else b"")  # type: ignore[operator]
+        qs = (scope.get("query_string") or b"").decode("latin-1")
+        url = f"{self.target}{path}" + (f"?{qs}" if qs else "")
         raw_headers: list[tuple[bytes, bytes]] = list(scope.get("headers") or [])  # type: ignore[arg-type]
         headers = [
             (k, v)
