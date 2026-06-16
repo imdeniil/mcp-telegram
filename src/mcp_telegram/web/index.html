@@ -37,7 +37,7 @@
                     <p class="text-slate-400 italic">Loading status...</p>
                 </div>
                 <div class="mt-6 pt-6 border-t border-slate-700">
-                    <button onclick="handleRestart()" class="w-full bg-slate-700 hover:bg-slate-600 text-white py-2 rounded-lg transition-colors flex items-center justify-center gap-2">
+                    <button id="restart-btn" onclick="handleRestart()" class="w-full bg-slate-700 hover:bg-slate-600 text-white py-2 rounded-lg transition-colors flex items-center justify-center gap-2">
                         🔄 Restart Service
                     </button>
                 </div>
@@ -75,13 +75,37 @@
                 
                 const dot = document.querySelector('#connection-status .status-dot');
                 const text = document.querySelector('#connection-status span:last-child');
-                
-                if (status.connected) {
+                const restartBtn = document.getElementById('restart-btn');
+                const rc = status.reconnect || {};
+
+                if (rc.status === 'reconnecting') {
+                    dot.className = 'status-dot bg-warning';
+                    text.innerText = `Reconnecting… (${rc.attempt}/${rc.max_attempts})`;
+                } else if (rc.status === 'manual_required') {
+                    dot.className = 'status-dot bg-danger';
+                    text.innerText = 'Manual restart required';
+                } else if (status.connected) {
                     dot.className = 'status-dot bg-success';
                     text.innerText = 'Connected';
                 } else {
                     dot.className = 'status-dot bg-danger';
                     text.innerText = 'Disconnected';
+                }
+
+                if (restartBtn) {
+                    const busy = rc.status === 'reconnecting';
+                    restartBtn.disabled = busy;
+                    restartBtn.classList.toggle('opacity-50', busy);
+                    restartBtn.classList.toggle('cursor-not-allowed', busy);
+                    restartBtn.classList.toggle('ring-2', rc.status === 'manual_required');
+                    restartBtn.classList.toggle('ring-red-500', rc.status === 'manual_required');
+                    if (busy) {
+                        restartBtn.innerText = `⏳ Reconnecting… (${rc.attempt}/${rc.max_attempts})`;
+                    } else if (rc.status === 'manual_required') {
+                        restartBtn.innerText = '🔄 Reconnect Now';
+                    } else {
+                        restartBtn.innerText = '🔄 Restart Service';
+                    }
                 }
 
                 const authInfo = document.getElementById('auth-info');
@@ -231,13 +255,24 @@
         }
 
         async function handleRestart() {
-            if (!confirm('This will restart the Telegram service. Continue?')) return;
+            const btn = document.getElementById('restart-btn');
+            if (btn && btn.disabled) return; // avoid spamming during an in-flight reconnect
+            if (!confirm('Reconnect the Telegram service now?')) return;
+            if (btn) {
+                btn.disabled = true;
+                btn.classList.add('opacity-50', 'cursor-not-allowed');
+                btn.innerText = '⏳ Reconnecting…';
+            }
             try {
                 await fetch('/api/control/restart', { method: 'POST' });
-                alert('Restart command sent. The dashboard will reload soon.');
-                setTimeout(() => location.reload(), 3000);
+                // No page reload — updateStatus() poll reflects the new reconnect state.
             } catch (e) {
-                alert('Service is restarting...');
+                console.error('Reconnect request failed', e);
+                if (btn) {
+                    btn.disabled = false;
+                    btn.classList.remove('opacity-50', 'cursor-not-allowed');
+                    btn.innerText = '🔄 Restart Service';
+                }
             }
         }
 
@@ -264,13 +299,15 @@
             evtSource.onmessage = function(event) {
                 try {
                     const entry = JSON.parse(event.data);
-                    const time = new Date(entry.time).toLocaleTimeString();
+                    const d = new Date(entry.time);
+                    const time = isNaN(d) ? (entry.time || '') : d.toLocaleTimeString();
                     const level = entry.level || 'INFO';
                     const color = LEVEL_COLORS[level] || 'text-slate-300';
+                    const logger = entry.logger || '';
 
                     const div = document.createElement('div');
                     div.className = 'mb-1';
-                    div.innerHTML = `<span class="text-slate-500">[${time}]</span> <span class="${color}">[${level}]</span> <span class="text-slate-400">${entry.logger}</span> ${entry.message}`;
+                    div.innerHTML = `<span class="text-slate-500">[${time}]</span> <span class="${color}">[${level}]</span> <span class="text-slate-400">${logger}</span> ${entry.message}`;
                     logs.appendChild(div);
 
                     // Trim old entries
