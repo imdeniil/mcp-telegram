@@ -784,26 +784,40 @@ async def resend_code(req: ResendCodeRequest):
     """
     if not _client:
         raise HTTPException(status_code=400, detail="Auth not started")
+
+    unavailable = (
+        "Telegram исчерпала способы доставки кода для этого номера "
+        "(flash-call/SMS). Подожди ~1–2 минуты и запроси код заново "
+        "(введи телефон ещё раз)."
+    )
+
+    # 1. Explicit resend (switches the delivery transport, e.g. flash -> SMS).
     try:
         result = await _client(
             functions.auth.ResendCodeRequest(
-                phone=req.phone, phone_code_hash=req.phone_code_hash
+                phone_number=req.phone, phone_code_hash=req.phone_code_hash
             )
         )
         return {"success": True, "phone_code_hash": result.phone_code_hash}
+    except errors.SendCodeUnavailableError:
+        return {"success": False, "error": unavailable, "retry_after": True}
     except Exception:
-        # All delivery options used -> request a fresh code instead.
-        try:
-            result = await _client.send_code_request(req.phone)
-            return {
-                "success": True,
-                "phone_code_hash": result.phone_code_hash,
-                "fresh": True,
-            }
-        except Exception as e:
-            logger.exception("Error resending code")
-            classified = _handle_telethon_error(e, "повторная отправка кода")
-            return {"success": False, "error": classified.detail}
+        pass
+
+    # 2. Fallback: request a fresh code (different path if resend is unsupported).
+    try:
+        result = await _client.send_code_request(req.phone)
+        return {
+            "success": True,
+            "phone_code_hash": result.phone_code_hash,
+            "fresh": True,
+        }
+    except errors.SendCodeUnavailableError:
+        return {"success": False, "error": unavailable, "retry_after": True}
+    except Exception as e:
+        logger.exception("Error resending code")
+        classified = _handle_telethon_error(e, "повторная отправка кода")
+        return {"success": False, "error": classified.detail}
 
 
 @app.post("/api/auth/sign-in")
