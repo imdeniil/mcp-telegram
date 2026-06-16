@@ -362,6 +362,13 @@ class SendCodeRequest(BaseModel):
     phone: str
 
 
+class ResendCodeRequest(BaseModel):
+    """Request to resend the auth code."""
+
+    phone: str
+    phone_code_hash: str
+
+
 class SignInRequest(BaseModel):
     """Request to sign in with code or 2FA."""
     phone: str
@@ -764,6 +771,39 @@ async def send_code(req: SendCodeRequest):
         logger.exception("Error sending code")
         classified = _handle_telethon_error(e, "отправка кода")
         return {"success": False, "error": classified.detail}
+
+
+@app.post("/api/auth/resend-code")
+async def resend_code(req: ResendCodeRequest):
+    """Resend the login code.
+
+    Tries ``ResendCodeRequest`` first (switches the delivery transport, e.g.
+    flash-call -> SMS). If all transports are exhausted, falls back to a fresh
+    ``send_code_request``. Returns the (possibly new) phone_code_hash to use for
+    sign-in.
+    """
+    if not _client:
+        raise HTTPException(status_code=400, detail="Auth not started")
+    try:
+        result = await _client(
+            functions.messages.ResendCodeRequest(
+                phone=req.phone, phone_code_hash=req.phone_code_hash
+            )
+        )
+        return {"success": True, "phone_code_hash": result.phone_code_hash}
+    except Exception:
+        # All delivery options used -> request a fresh code instead.
+        try:
+            result = await _client.send_code_request(req.phone)
+            return {
+                "success": True,
+                "phone_code_hash": result.phone_code_hash,
+                "fresh": True,
+            }
+        except Exception as e:
+            logger.exception("Error resending code")
+            classified = _handle_telethon_error(e, "повторная отправка кода")
+            return {"success": False, "error": classified.detail}
 
 
 @app.post("/api/auth/sign-in")

@@ -183,8 +183,34 @@
                     <p class="text-sm text-slate-400 text-blue-400">Code sent to your Telegram app!</p>
                     <input type="text" id="code-input" placeholder="Enter code" class="w-full bg-slate-900 border border-slate-700 p-2 rounded text-white outline-none focus:border-blue-500">
                     <button onclick="signIn()" id="btn-sign-in" class="w-full bg-blue-600 hover:bg-blue-500 py-2 rounded font-medium">Sign In</button>
+                    <button onclick="resendCode()" id="btn-resend" class="w-full bg-slate-700 hover:bg-slate-600 py-2 rounded text-sm">Resend code</button>
+                    <p id="resend-msg" class="text-xs text-slate-500"></p>
                 </div>
             `;
+        }
+
+        async function resendCode() {
+            const btn = document.getElementById('btn-resend');
+            const msg = document.getElementById('resend-msg');
+            btn.disabled = true;
+            msg.textContent = 'Resending...';
+            try {
+                const res = await fetch('/api/auth/resend-code', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ phone: authState.phone, phone_code_hash: authState.phone_hash })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    authState.phone_hash = data.phone_code_hash;
+                    msg.textContent = data.fresh ? 'New code requested.' : 'Code resent.';
+                } else {
+                    msg.textContent = 'Error: ' + (data.error || 'failed');
+                }
+            } catch (e) {
+                msg.textContent = 'Resend failed.';
+            }
+            btn.disabled = false;
         }
 
         async function signIn() {
