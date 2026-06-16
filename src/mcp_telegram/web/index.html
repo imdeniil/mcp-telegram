@@ -164,6 +164,8 @@
                 if (data.success) {
                     authState.phone = phone;
                     authState.phone_hash = data.phone_code_hash;
+                    authState.via = data.via;
+                    authState.next_type = data.next_type;
                     showCodeForm();
                 } else {
                     alert('Error: ' + data.error);
@@ -175,12 +177,31 @@
             }
         }
 
+        function viaDescribe(via) {
+            switch ((via || '').toLowerCase()) {
+                case 'app':
+                    return 'the Telegram <b>app</b> (open Telegram → messages/notifications)';
+                case 'sms':
+                    return '<b>SMS</b>';
+                case 'call':
+                    return 'a <b>phone call</b> (last digits of the caller number = code)';
+                case 'flashcall':
+                    return 'a <b>flash call</b> (last digits of caller = code)';
+                case 'missedcall':
+                    return 'a <b>missed call</b> (last digits = code)';
+                default:
+                    return 'Telegram';
+            }
+        }
+
         function showCodeForm() {
             authState.step = 'code';
             const container = document.getElementById('auth-form-container');
+            const next = authState.next_type ? ` Resend will switch to ${authState.next_type}.` : '';
             container.innerHTML = `
                 <div class="space-y-4">
-                    <p class="text-sm text-slate-400 text-blue-400">Code sent to your Telegram app!</p>
+                    <p class="text-sm text-blue-400">Code sent via ${viaDescribe(authState.via)}.</p>
+                    <p class="text-xs text-slate-500">Didn't get it? Check the Telegram app and missed calls first.${next}</p>
                     <input type="text" id="code-input" placeholder="Enter code" class="w-full bg-slate-900 border border-slate-700 p-2 rounded text-white outline-none focus:border-blue-500">
                     <button onclick="signIn()" id="btn-sign-in" class="w-full bg-blue-600 hover:bg-blue-500 py-2 rounded font-medium">Sign In</button>
                     <button onclick="resendCode()" id="btn-resend" class="w-full bg-slate-700 hover:bg-slate-600 py-2 rounded text-sm">Resend code</button>
@@ -203,7 +224,10 @@
                 const data = await res.json();
                 if (data.success) {
                     authState.phone_hash = data.phone_code_hash;
-                    msg.textContent = data.fresh ? 'New code requested.' : 'Code resent.';
+                    authState.via = data.via;
+                    authState.next_type = data.next_type;
+                    const how = data.via ? ` via ${data.via}` : '';
+                    msg.textContent = (data.fresh ? 'New code requested' : 'Code resent') + how + '.';
                 } else {
                     msg.textContent = 'Error: ' + (data.error || 'failed');
                 }

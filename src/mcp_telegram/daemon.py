@@ -723,6 +723,20 @@ async def get_status():
     return status
 
 
+def _sent_code_via(result: Any) -> dict[str, Any]:
+    """Extract how Telegram delivered the code (app/sms/call/…)."""
+    def label(t: Any) -> str | None:
+        if t is None:
+            return None
+        return type(t).__name__.replace("SentCodeType", "").lower()
+
+    return {
+        "via": label(getattr(result, "type", None)),
+        "next_type": label(getattr(result, "next_type", None)),
+        "timeout": getattr(result, "timeout", None),
+    }
+
+
 @app.post("/api/auth/send-code")
 async def send_code(req: SendCodeRequest):
     """Start auth flow by sending code."""
@@ -766,7 +780,11 @@ async def send_code(req: SendCodeRequest):
             
         await _client.connect()
         result = await _client.send_code_request(req.phone)
-        return {"success": True, "phone_code_hash": result.phone_code_hash}
+        return {
+            "success": True,
+            "phone_code_hash": result.phone_code_hash,
+            **_sent_code_via(result),
+        }
     except Exception as e:
         logger.exception("Error sending code")
         classified = _handle_telethon_error(e, "отправка кода")
@@ -798,7 +816,11 @@ async def resend_code(req: ResendCodeRequest):
                 phone_number=req.phone, phone_code_hash=req.phone_code_hash
             )
         )
-        return {"success": True, "phone_code_hash": result.phone_code_hash}
+        return {
+            "success": True,
+            "phone_code_hash": result.phone_code_hash,
+            **_sent_code_via(result),
+        }
     except errors.SendCodeUnavailableError:
         return {"success": False, "error": unavailable, "retry_after": True}
     except Exception:
@@ -811,6 +833,7 @@ async def resend_code(req: ResendCodeRequest):
             "success": True,
             "phone_code_hash": result.phone_code_hash,
             "fresh": True,
+            **_sent_code_via(result),
         }
     except errors.SendCodeUnavailableError:
         return {"success": False, "error": unavailable, "retry_after": True}
