@@ -41,7 +41,9 @@ services:
     restart: unless-stopped
     command: ["mcp-telegram", "daemon"]
 
-  # Optional: Run MCP server in container
+  # MCP server (HTTP transport for Dify and other HTTP-based MCP clients).
+  # Exposes SSE (default) or streamable-http. Set MCP_AUTH_TOKEN before
+  # exposing publicly — anyone with the token can act on your Telegram account.
   mcp-server:
     build:
       context: .
@@ -52,9 +54,28 @@ services:
         condition: service_healthy
     environment:
       - DAEMON_URL=http://daemon:8765
+      - MCP_TRANSPORT=${MCP_TRANSPORT:-sse}
+      - MCP_HOST=${MCP_HOST:-0.0.0.0}
+      - MCP_PORT=${MCP_PORT:-8766}
+      - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:-}
+      - MCP_ALLOWED_HOSTS=${MCP_ALLOWED_HOSTS:-}
+      - MCP_DISABLE_HOST_VALIDATION=${MCP_DISABLE_HOST_VALIDATION:-false}
+    ports:
+      # Loopback by default — front it with your own reverse proxy (TLS) for
+      # public exposure. Change MCP_HOST/ports to widen.
+      - "127.0.0.1:${MCP_PORT:-8766}:${MCP_PORT:-8766}"
+    restart: unless-stopped
     command: ["mcp-telegram", "start", "--daemon"]
-    profiles:
-      - mcp
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s -o /dev/null -w '%{http_code}' -m 2 http://localhost:${MCP_PORT:-8766}/sse | grep -qE '200|401'",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
 
 volumes:
   postgres_data:

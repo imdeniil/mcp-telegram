@@ -21,7 +21,7 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from mcp_telegram.daemon import DaemonConfig, run_daemon
-from mcp_telegram.server import mcp
+from mcp_telegram.server import mcp, run_direct_server
 from mcp_telegram.server_proxy import run_proxy_server
 from mcp_telegram.telegram import Telegram
 
@@ -285,18 +285,45 @@ def start(
     daemon: bool = typer.Option(
         False, "--daemon", "-d", help="Connect to daemon instead of direct Telegram"
     ),
+    transport: str = typer.Option(
+        "stdio",
+        "--transport",
+        "-t",
+        envvar="MCP_TRANSPORT",
+        help="Transport: stdio (default), sse, streamable-http",
+    ),
+    host: str = typer.Option(
+        "0.0.0.0", "--host", envvar="MCP_HOST", help="Bind address for HTTP transports"
+    ),
+    port: int = typer.Option(
+        8766, "--port", "-p", envvar="MCP_PORT", help="Bind port for HTTP transports"
+    ),
+    auth_token: str | None = typer.Option(
+        None,
+        "--auth-token",
+        envvar="MCP_AUTH_TOKEN",
+        help="Require 'Authorization: Bearer <token>' for HTTP transports",
+    ),
 ) -> None:
     """Start the MCP Telegram server.
 
-    By default, connects directly to Telegram (single process mode).
+    By default, connects directly to Telegram over stdio (single process mode).
     Use --daemon to connect to a running daemon (multi-terminal mode).
+
+    For HTTP transports (so Dify/other HTTP clients can reach the server), pass
+    --transport sse (or streamable-http) with --host/--port. Set --auth-token
+    (or MCP_AUTH_TOKEN) before exposing the server publicly.
     """
     if daemon:
         Console(stderr=True).print("[dim]Starting MCP server in daemon mode...[/dim]")
-        run_proxy_server()
+        run_proxy_server(
+            transport=transport, host=host, port=port, auth_token=auth_token
+        )
     else:
         Console(stderr=True).print("[dim]Starting MCP server in direct mode...[/dim]")
-        mcp.run()
+        run_direct_server(
+            transport=transport, host=host, port=port, auth_token=auth_token
+        )
 
 
 @app.command()
@@ -405,12 +432,14 @@ def setup() -> None:
         run_daemon(config)
 
 
-import sys
-import traceback
 
 def version_callback(value: bool):
     if value:
-        print("mcp-telegram version 0.2.1")
+        try:
+            v = importlib.metadata.version("mcp-telegram")
+        except importlib.metadata.PackageNotFoundError:
+            v = "unknown"
+        print(f"mcp-telegram version {v}")
         raise typer.Exit()
 
 @app.callback()

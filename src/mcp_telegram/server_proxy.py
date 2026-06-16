@@ -6,6 +6,7 @@ then run this proxy in each terminal.
 """
 
 import logging
+
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -14,9 +15,10 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from mcp_telegram.proxy import get_daemon_client
+from mcp_telegram.transport import run_mcp_server
 from mcp_telegram.types import (
-    DATE_INPUT_GUIDE,
     ChatMessages,
+    DATE_INPUT_GUIDE,
     Dialog,
     DialogType,
     DownloadedMedia,
@@ -66,7 +68,7 @@ mcp = FastMCP(
 @mcp.resource(
     "docs://date-formats",
     name="date-formats",
-    description="How to enter dates for date-filtered tools (get_messages, export_messages).",
+    description="How to enter dates for date-filtered tools.",
 )
 def date_formats() -> str:
     """Date input guide for date-filtered tools."""
@@ -432,6 +434,13 @@ async def message_from_link(link: str) -> Message:
         return _classify_error(e, "message_from_link")  # type: ignore[return-value]
 
 
-def run_proxy_server():
-    """Run the MCP proxy server."""
-    mcp.run()
+def run_proxy_server(
+    transport: str = "stdio",
+    host: str = "0.0.0.0",
+    port: int = 8766,
+    auth_token: str | None = None,
+) -> None:
+    """Run the MCP proxy server (daemon-backed) on the given transport."""
+    run_mcp_server(
+        mcp, transport=transport, host=host, port=port, auth_token=auth_token
+    )

@@ -7,6 +7,7 @@ from datetime import datetime
 from mcp.server.fastmcp import FastMCP
 
 from mcp_telegram.telegram import Telegram
+from mcp_telegram.transport import run_mcp_server
 from mcp_telegram.types import (
     DATE_INPUT_GUIDE,
     Dialog,
@@ -43,7 +44,7 @@ mcp = FastMCP(
 @mcp.resource(
     "docs://date-formats",
     name="date-formats",
-    description="How to enter dates for date-filtered tools (get_messages, export_messages).",
+    description="How to enter dates for date-filtered tools.",
 )
 def date_formats() -> str:
     """Date input guide for date-filtered tools."""
@@ -580,3 +581,15 @@ async def reorder_folders(folder_ids: list[int]) -> str:
     """
     await tg.reorder_folders(folder_ids)
     return f"Folders reordered: {folder_ids}"
+
+
+def run_direct_server(
+    transport: str = "stdio",
+    host: str = "0.0.0.0",
+    port: int = 8766,
+    auth_token: str | None = None,
+) -> None:
+    """Run the direct-mode MCP server (no daemon) on the given transport."""
+    run_mcp_server(
+        mcp, transport=transport, host=host, port=port, auth_token=auth_token
+    )

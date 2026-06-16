@@ -117,6 +117,62 @@ Add the following to your `claude_desktop_config.json` or Cursor settings:
 
 ---
 
+## 🌐 Connecting to Dify (HTTP Transport)
+
+Dify supports MCP only over HTTP (SSE or Streamable HTTP), not stdio. Run the
+MCP server with an HTTP transport and expose it behind your reverse proxy.
+
+### 1. Configure transport + auth
+
+In `.env` (or the compose environment):
+
+```bash
+MCP_TRANSPORT=sse                         # or streamable-http
+MCP_HOST=0.0.0.0
+MCP_PORT=8766
+MCP_AUTH_TOKEN=<long-random-secret>       # REQUIRED before public exposure
+MCP_ALLOWED_HOSTS=mcp.example.com:*       # Host header Dify will use
+```
+
+Bring up the daemon + MCP server:
+
+```bash
+docker compose up -d --build
+```
+
+### 2. Expose publicly (TLS via your reverse proxy)
+
+The compose binds the MCP port to `127.0.0.1:8766` by default. Front it with
+your own reverse proxy (nginx / Caddy / Cloudflare Tunnel) terminating TLS on a
+public domain, e.g. `https://mcp.example.com`, proxying to `127.0.0.1:8766`.
+
+> Endpoint paths: `sse` transport → `/sse`, `streamable-http` → `/mcp`.
+
+### 3. Add it in Dify
+
+**Tools → MCP → Add MCP Server (HTTP):**
+
+- **Server URL:** `https://mcp.example.com/sse` (or `…/mcp` for streamable-http)
+- **Headers:** `Authorization: Bearer <MCP_AUTH_TOKEN>`
+- **Server ID:** `telegram`
+
+Click **Update Tools** — `send_message`, `search_dialogs`, `get_messages`,
+`get_folders`, … should appear.
+
+### Notes
+
+- **SSRF proxy:** Dify routes outbound HTTP (including MCP calls) through its SSRF
+  proxy (Squid), which blocks private/loopback ranges. A **public domain** on port
+  443 / 8766 passes through, so no Squid ACL is needed when the MCP is on a public
+  host. Co-located / LAN deployments would need to allow the docker network in Squid.
+- **Auth is mandatory for public exposure.** Without `MCP_AUTH_TOKEN`, anyone who
+  finds the URL can act on your Telegram account. Dify sends the `Authorization`
+  header on both the SSE stream and the message POSTs.
+- **stdio still works** (default): `mcp-telegram start` (or `start --daemon`)
+  without `--transport` runs stdio as before, for Claude Desktop / Claude Code.
+
+---
+
 ## 🧰 Available Tools
 
 | Tool | Description |
