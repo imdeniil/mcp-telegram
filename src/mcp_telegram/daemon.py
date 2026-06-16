@@ -28,6 +28,7 @@ from telethon.tl import functions  # type: ignore
 from telethon.utils import get_peer_id
 
 from mcp_telegram.session import PostgresSession, create_session_pool, init_session
+from mcp_telegram.telegram import Telegram
 from mcp_telegram.types import Dialog
 from mcp_telegram.utils import parse_entity
 
@@ -1200,6 +1201,131 @@ async def message_from_link(link: str, client: TelegramClient = Depends(get_clie
     except Exception as e:
         logger.error(f"Error getting message from link: {e}")
         raise _handle_telethon_error(e, "получение сообщения по ссылке")
+
+
+# --- Folder (dialog filter) endpoints ---
+def _tg(client: TelegramClient) -> Telegram:
+    """Wrap the daemon's TelegramClient in the Telegram helper so its folder
+    methods are reused without creating a separate session.
+    """
+    tg = Telegram()
+    tg._client = client
+    return tg
+
+
+class CreateFolderRequest(BaseModel):
+    """Request body for creating a chat folder."""
+
+    title: str
+    emoticon: str | None = None
+    include_entities: list[str | int] | None = None
+    exclude_entities: list[str | int] | None = None
+    contacts: bool = False
+    non_contacts: bool = False
+    groups: bool = False
+    broadcasts: bool = False
+    bots: bool = False
+    exclude_muted: bool = False
+    exclude_read: bool = False
+    exclude_archived: bool = False
+
+
+class UpdateFolderRequest(BaseModel):
+    """Request body for updating a chat folder."""
+
+    title: str | None = None
+    emoticon: str | None = None
+    add_entities: list[str | int] | None = None
+    remove_entities: list[str | int] | None = None
+
+
+@app.post("/get_folders")
+async def get_folders(client: TelegramClient = Depends(get_client)):
+    """List all chat folders (dialog filters)."""
+    try:
+        folders = await _tg(client).get_folders()
+        return {"folders": [f.model_dump(mode="json") for f in folders]}
+    except Exception as e:
+        raise _handle_telethon_error(e, "получение папок")
+
+
+@app.post("/get_folder_chats")
+async def get_folder_chats(
+    folder_id: int, limit: int = 100, client: TelegramClient = Depends(get_client)
+):
+    """List chats in a folder."""
+    try:
+        dialogs = await _tg(client).get_folder_dialogs(folder_id, limit)
+        return {"dialogs": [d.model_dump(mode="json") for d in dialogs]}
+    except Exception as e:
+        raise _handle_telethon_error(e, "получение чатов папки")
+
+
+@app.post("/create_folder")
+async def create_folder(
+    req: CreateFolderRequest, client: TelegramClient = Depends(get_client)
+):
+    """Create a chat folder."""
+    try:
+        folder = await _tg(client).create_folder(
+            req.title,
+            emoticon=req.emoticon,
+            include_entities=req.include_entities,
+            exclude_entities=req.exclude_entities,
+            contacts=req.contacts,
+            non_contacts=req.non_contacts,
+            groups=req.groups,
+            broadcasts=req.broadcasts,
+            bots=req.bots,
+            exclude_muted=req.exclude_muted,
+            exclude_read=req.exclude_read,
+            exclude_archived=req.exclude_archived,
+        )
+        return folder.model_dump(mode="json")
+    except Exception as e:
+        raise _handle_telethon_error(e, "создание папки")
+
+
+@app.post("/update_folder")
+async def update_folder(
+    folder_id: int,
+    req: UpdateFolderRequest,
+    client: TelegramClient = Depends(get_client),
+):
+    """Update a chat folder (rename / add / remove chats)."""
+    try:
+        folder = await _tg(client).update_folder(
+            folder_id,
+            title=req.title,
+            emoticon=req.emoticon,
+            add_entities=req.add_entities,
+            remove_entities=req.remove_entities,
+        )
+        return folder.model_dump(mode="json")
+    except Exception as e:
+        raise _handle_telethon_error(e, "обновление папки")
+
+
+@app.post("/delete_folder")
+async def delete_folder(folder_id: int, client: TelegramClient = Depends(get_client)):
+    """Delete a chat folder."""
+    try:
+        await _tg(client).delete_folder(folder_id)
+        return {"success": True}
+    except Exception as e:
+        raise _handle_telethon_error(e, "удаление папки")
+
+
+@app.post("/reorder_folders")
+async def reorder_folders(
+    folder_ids: list[int], client: TelegramClient = Depends(get_client)
+):
+    """Reorder chat folders."""
+    try:
+        await _tg(client).reorder_folders(folder_ids)
+        return {"success": True}
+    except Exception as e:
+        raise _handle_telethon_error(e, "переупорядочивание папок")
 
 
 def run_daemon(config: DaemonConfig):

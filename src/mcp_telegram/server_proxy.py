@@ -23,6 +23,7 @@ from mcp_telegram.types import (
     DialogType,
     DownloadedMedia,
     ExportResult,
+    Folder,
     Media,
     Message,
     Messages,
@@ -161,6 +162,28 @@ def _parse_export(data: dict[str, Any]) -> ExportResult:
         results=results,
         chats_processed=data.get("chats_processed", len(results)),
         truncated=bool(data.get("truncated", False)),
+    )
+
+
+def _parse_folder(d: dict[str, Any]) -> Folder:
+    """Parse a folder dict from a daemon response."""
+    return Folder(
+        id=d["id"],
+        title=d.get("title", ""),
+        emoticon=d.get("emoticon"),
+        contacts=bool(d.get("contacts", False)),
+        non_contacts=bool(d.get("non_contacts", False)),
+        groups=bool(d.get("groups", False)),
+        broadcasts=bool(d.get("broadcasts", False)),
+        bots=bool(d.get("bots", False)),
+        exclude_muted=bool(d.get("exclude_muted", False)),
+        exclude_read=bool(d.get("exclude_read", False)),
+        exclude_archived=bool(d.get("exclude_archived", False)),
+        include_peer_ids=list(d.get("include_peer_ids", [])),
+        exclude_peer_ids=list(d.get("exclude_peer_ids", [])),
+        pinned_peer_ids=list(d.get("pinned_peer_ids", [])),
+        is_chatlist=bool(d.get("is_chatlist", False)),
+        is_default=bool(d.get("is_default", False)),
     )
 
 
@@ -388,6 +411,156 @@ async def export_messages(
         return _parse_export(result)
     except Exception as e:
         return _classify_error(e, "export_messages")  # type: ignore[return-value]
+
+
+@mcp.tool()
+async def get_folders() -> list[Folder]:
+    """Get all chat folders (dialog filters)."""
+    client = get_daemon_client()
+    try:
+        result = await client.get_folders()
+        return [_parse_folder(f) for f in result.get("folders", [])]
+    except Exception as e:
+        return _classify_error(e, "get_folders")  # type: ignore[return-value]
+
+
+@mcp.tool()
+async def get_folder_chats(folder_id: int, limit: int = 100) -> list[Dialog]:
+    """Get the chats that belong to a specific folder.
+
+    Args:
+        folder_id: The folder ID (use get_folders to find it). 0 = all
+            non-archived, 1 = archived.
+        limit: Max number of chats to return. Default 100.
+
+    Returns:
+        The dialogs contained in the folder.
+    """
+    client = get_daemon_client()
+    try:
+        result = await client.get_folder_chats(folder_id, limit)
+        return _parse_dialogs(result)
+    except Exception as e:
+        return _classify_error(e, "get_folder_chats")  # type: ignore[return-value]
+
+
+@mcp.tool()
+async def create_folder(
+    title: str,
+    emoticon: str | None = None,
+    include_entities: list[str | int] | None = None,
+    exclude_entities: list[str | int] | None = None,
+    contacts: bool = False,
+    non_contacts: bool = False,
+    groups: bool = False,
+    broadcasts: bool = False,
+    bots: bool = False,
+    exclude_muted: bool = False,
+    exclude_read: bool = False,
+    exclude_archived: bool = False,
+) -> Folder:
+    """Create a new chat folder.
+
+    Args:
+        title: The folder title.
+        emoticon: Optional emoji icon.
+        include_entities: Entities to explicitly include.
+        exclude_entities: Entities to explicitly exclude.
+        contacts/non_contacts/groups/broadcasts/bots: Auto-include criteria.
+        exclude_muted/exclude_read/exclude_archived: Auto-exclude criteria.
+
+    Returns:
+        The created folder.
+    """
+    client = get_daemon_client()
+    try:
+        result = await client.create_folder(
+            title,
+            emoticon=emoticon,
+            include_entities=include_entities,
+            exclude_entities=exclude_entities,
+            contacts=contacts,
+            non_contacts=non_contacts,
+            groups=groups,
+            broadcasts=broadcasts,
+            bots=bots,
+            exclude_muted=exclude_muted,
+            exclude_read=exclude_read,
+            exclude_archived=exclude_archived,
+        )
+        return _parse_folder(result)
+    except Exception as e:
+        return _classify_error(e, "create_folder")  # type: ignore[return-value]
+
+
+@mcp.tool()
+async def update_folder(
+    folder_id: int,
+    title: str | None = None,
+    emoticon: str | None = None,
+    add_entities: list[str | int] | None = None,
+    remove_entities: list[str | int] | None = None,
+) -> Folder:
+    """Update an existing chat folder (rename / add / remove chats).
+
+    Args:
+        folder_id: The folder ID to update.
+        title: New title.
+        emoticon: New emoji icon (empty string clears it).
+        add_entities: Entities to add.
+        remove_entities: Entities to remove.
+
+    Returns:
+        The updated folder.
+    """
+    client = get_daemon_client()
+    try:
+        result = await client.update_folder(
+            folder_id,
+            title=title,
+            emoticon=emoticon,
+            add_entities=add_entities,
+            remove_entities=remove_entities,
+        )
+        return _parse_folder(result)
+    except Exception as e:
+        return _classify_error(e, "update_folder")  # type: ignore[return-value]
+
+
+@mcp.tool()
+async def delete_folder(folder_id: int) -> str:
+    """Delete a chat folder.
+
+    Args:
+        folder_id: The folder ID to delete (must be a user folder, ID >= 2).
+
+    Returns:
+        Success confirmation.
+    """
+    client = get_daemon_client()
+    try:
+        await client.delete_folder(folder_id)
+        return f"Folder {folder_id} deleted"
+    except Exception as e:
+        return _classify_error(e, "delete_folder")
+
+
+@mcp.tool()
+async def reorder_folders(folder_ids: list[int]) -> str:
+    """Reorder chat folders.
+
+    Args:
+        folder_ids: The desired order of folder IDs.
+
+    Returns:
+        Success confirmation.
+    """
+    client = get_daemon_client()
+    try:
+        await client.reorder_folders(folder_ids)
+        return f"Folders reordered: {folder_ids}"
+    except Exception as e:
+        return _classify_error(e, "reorder_folders")
 
 
 @mcp.tool()

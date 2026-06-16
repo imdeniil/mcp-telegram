@@ -172,6 +172,88 @@ class DaemonClient:
             },
         )
 
+    async def get_folders(self) -> dict[str, Any]:
+        """List all chat folders."""
+        return await self._request("POST", "/get_folders")
+
+    async def get_folder_chats(
+        self, folder_id: int, limit: int = 100
+    ) -> dict[str, Any]:
+        """List chats in a folder."""
+        return await self._request(
+            "POST",
+            "/get_folder_chats",
+            params={"folder_id": folder_id, "limit": limit},
+        )
+
+    async def create_folder(
+        self,
+        title: str,
+        emoticon: str | None = None,
+        include_entities: list[str | int] | None = None,
+        exclude_entities: list[str | int] | None = None,
+        contacts: bool = False,
+        non_contacts: bool = False,
+        groups: bool = False,
+        broadcasts: bool = False,
+        bots: bool = False,
+        exclude_muted: bool = False,
+        exclude_read: bool = False,
+        exclude_archived: bool = False,
+    ) -> dict[str, Any]:
+        """Create a chat folder."""
+        return await self._request(
+            "POST",
+            "/create_folder",
+            json={
+                "title": title,
+                "emoticon": emoticon,
+                "include_entities": include_entities,
+                "exclude_entities": exclude_entities,
+                "contacts": contacts,
+                "non_contacts": non_contacts,
+                "groups": groups,
+                "broadcasts": broadcasts,
+                "bots": bots,
+                "exclude_muted": exclude_muted,
+                "exclude_read": exclude_read,
+                "exclude_archived": exclude_archived,
+            },
+        )
+
+    async def update_folder(
+        self,
+        folder_id: int,
+        title: str | None = None,
+        emoticon: str | None = None,
+        add_entities: list[str | int] | None = None,
+        remove_entities: list[str | int] | None = None,
+    ) -> dict[str, Any]:
+        """Update a chat folder."""
+        return await self._request(
+            "POST",
+            "/update_folder",
+            params={"folder_id": folder_id},
+            json={
+                "title": title,
+                "emoticon": emoticon,
+                "add_entities": add_entities,
+                "remove_entities": remove_entities,
+            },
+        )
+
+    async def delete_folder(self, folder_id: int) -> dict[str, Any]:
+        """Delete a chat folder."""
+        return await self._request(
+            "POST", "/delete_folder", params={"folder_id": folder_id}
+        )
+
+    async def reorder_folders(self, folder_ids: list[int]) -> dict[str, Any]:
+        """Reorder chat folders."""
+        return await self._request(
+            "POST", "/reorder_folders", params={"folder_ids": folder_ids}
+        )
+
     async def get_draft(self, entity: str | int) -> dict[str, Any]:
         """Get draft."""
         return await self._request(
