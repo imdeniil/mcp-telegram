@@ -156,6 +156,7 @@ class ReverseProxy:
                 if not msg.get("more_body"):
                     break
         resp = None
+        started = False
         try:
             req = self.client.build_request(method, url, headers=headers, content=body)  # type: ignore[arg-type]
             resp = await self.client.send(req, stream=True)
@@ -172,6 +173,7 @@ class ReverseProxy:
                     "headers": out_headers,
                 }
             )
+            started = True
             async for chunk in resp.aiter_raw():
                 await send(
                     {"type": "http.response.body", "body": chunk, "more_body": True}
@@ -179,7 +181,10 @@ class ReverseProxy:
             await send({"type": "http.response.body", "body": b"", "more_body": False})
         except Exception as e:
             logger.warning(f"reverse-proxy error to {url}: {e}")
-            await _send_bad_gateway(send)
+            # Only synthesize a 502 if we haven't started the real response;
+            # sending a second http.response.start would violate the ASGI spec.
+            if not started:
+                await _send_bad_gateway(send)
         finally:
             if resp is not None:
                 await resp.aclose()
