@@ -167,7 +167,7 @@ MCP_TRANSPORT=sse                         # or streamable-http
 MCP_HOST=0.0.0.0
 MCP_PORT=8766
 MCP_AUTH_TOKEN=<long-random-secret>       # REQUIRED before public exposure
-MCP_ALLOWED_HOSTS=mcp.example.com:*       # Host header Dify will use
+MCP_ALLOWED_HOSTS=mcp.example.com         # public domain (bare: HTTPS Host has no port)
 ```
 
 Bring up the daemon + MCP server:

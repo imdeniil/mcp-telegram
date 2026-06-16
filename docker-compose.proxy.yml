@@ -7,7 +7,7 @@
 #   docker compose -f docker-compose.yml -f docker-compose.proxy.yml up -d --build
 #
 # Required .env: MCP_VIRTUAL_HOST, LETSENCRYPT_EMAIL, MCP_AUTH_TOKEN,
-# MCP_ALLOWED_HOSTS (set to the virtual host, e.g. tg.keemor.su:*).
+# MCP_ALLOWED_HOSTS (set to the virtual host, e.g. tg.keemor.su; bare for HTTPS).
 
 services:
   mcp-server:
