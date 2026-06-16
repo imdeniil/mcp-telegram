@@ -292,10 +292,10 @@ def start(
     Use --daemon to connect to a running daemon (multi-terminal mode).
     """
     if daemon:
-        console.print("[dim]Starting MCP server in daemon mode...[/dim]")
+        Console(stderr=True).print("[dim]Starting MCP server in daemon mode...[/dim]")
         run_proxy_server()
     else:
-        console.print("[dim]Starting MCP server in direct mode...[/dim]")
+        Console(stderr=True).print("[dim]Starting MCP server in direct mode...[/dim]")
         mcp.run()
 
 

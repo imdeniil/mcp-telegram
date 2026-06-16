@@ -8,11 +8,10 @@ import asyncio
 import json
 import logging
 import os
-import signal
 
 from collections import deque
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -29,13 +28,14 @@ from telethon.tl import functions  # type: ignore
 from telethon.utils import get_peer_id
 
 from mcp_telegram.session import PostgresSession, create_session_pool, init_session
+from mcp_telegram.types import Dialog
 from mcp_telegram.utils import parse_entity
 
 logger = logging.getLogger(__name__)
 
 # --- Log streaming for web UI ---
 _log_subscribers: list[asyncio.Queue[str]] = []
-_log_history: deque[str] = deque(maxlen=200)
+_log_history: deque[str] = deque(maxlen=2000)
 
 
 class _QueueLogHandler(logging.Handler):
@@ -43,10 +43,11 @@ class _QueueLogHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            ts = datetime.fromtimestamp(record.created, tz=timezone.utc).strftime("%H:%M:%S")
+            ts = datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat()
             line = json.dumps({
                 "time": ts,
                 "level": record.levelname,
+                "logger": record.name,
                 "message": self.format(record),
             })
             _log_history.append(line)
@@ -211,11 +212,69 @@ def _serialize_message(msg: Any) -> dict[str, Any]:
     }
 
 
+async def _fetch_message_window(
+    client: TelegramClient,
+    entity: Any,
+    limit: int,
+    start_date: datetime,
+    end_date: datetime | None,
+    offset_id: int | None,
+    reverse: bool = False,
+) -> tuple[list[dict[str, Any]], bool, int | None]:
+    """Fetch one bounded page of messages within [start_date, end_date].
+
+    Iterates backwards from `end_date`/`offset_id`, stops at `start_date` or at
+    `limit` messages. Returns ``(serialized_messages, has_more, next_offset_id)``.
+    """
+    result: list[dict[str, Any]] = []
+    hit_boundary = False
+    iter_kwargs: dict[str, Any] = {"offset_date": end_date, "reverse": reverse}
+    if offset_id:
+        iter_kwargs["offset_id"] = offset_id
+    async for msg in client.iter_messages(entity, **iter_kwargs):  # type: ignore
+        if not isinstance(msg, types.Message):
+            continue
+        msg_date = getattr(msg, "date", None)
+        if msg_date is None:
+            continue
+        if msg_date < start_date:
+            hit_boundary = True
+            break
+        if len(result) >= limit:
+            break
+        media_info = _serialize_media(getattr(msg, "media", None))
+        result.append(
+            {
+                "id": msg.id,
+                "text": getattr(msg, "message", "") or "",
+                "date": msg_date.isoformat(),
+                "from_id": getattr(msg, "sender_id", None),
+                "out": getattr(msg, "out", False),
+                "has_media": media_info is not None,
+                "media": media_info,
+            }
+        )
+
+    has_more = (not hit_boundary) and len(result) >= limit
+    next_offset_id = result[-1]["id"] if (result and has_more) else None
+    return result, has_more, next_offset_id
+
+
 # Global state
 _db_pool: asyncpg.Pool | None = None
 _client: TelegramClient | None = None
 _session: PostgresSession | None = None
 _account_id: UUID | None = None
+
+# --- Telegram reconnect state (watchdog-driven) ---
+_RECONNECT_MAX_ATTEMPTS = 3
+_reconnect: dict[str, Any] = {
+    "status": "connected",  # connected | reconnecting | manual_required
+    "attempt": 0,
+    "last_error": None,
+}
+_reconnect_event: asyncio.Event | None = None
+_watchdog_task: asyncio.Task[None] | None = None
 
 
 class DaemonConfig(BaseModel):
@@ -272,6 +331,16 @@ class GetMessagesRequest(BaseModel):
     reverse: bool = False
 
 
+class ExportMessagesRequest(BaseModel):
+    """Request body for cross-chat message export."""
+
+    entities: list[str | int] | None = None
+    start_date: str
+    end_date: str | None = None
+    per_chat_limit: int = 100
+    max_chats: int = 30
+
+
 class SetDraftRequest(BaseModel):
     """Request body for setting a draft."""
 
@@ -320,12 +389,124 @@ async def _run_schema_migrations(pool: asyncpg.Pool) -> None:
                 raise
 
 
+async def _attempt_reconnect(config: DaemonConfig) -> bool:
+    """Perform one Telegram reconnect attempt.
+
+    Best-effort disconnects the current client, (re)creates the session and
+    client if needed, connects (with a 30 s timeout), and verifies the account
+    is authorized. Updates ``_reconnect['last_error']`` on failure.
+
+    Args:
+        config (`DaemonConfig`): Daemon configuration with API credentials.
+
+    Returns:
+        `bool`: True if the client is connected and authorized afterwards.
+    """
+    global _client, _session
+
+    try:
+        if _client is not None:
+            try:
+                await _client.disconnect()
+            except Exception as e:
+                logger.warning(f"Error disconnecting before reconnect: {e}")
+
+        if _session is None and _account_id is not None and _db_pool is not None:
+            _session = await init_session(_db_pool, _account_id)
+
+        if _client is None and _session is not None:
+            _client = TelegramClient(
+                session=_session,
+                api_id=config.api_id,
+                api_hash=config.api_hash,
+            )
+
+        if _client is None:
+            _reconnect["last_error"] = "No session/account available to reconnect"
+            return False
+
+        await asyncio.wait_for(_client.connect(), timeout=30)
+
+        if not await _client.is_user_authorized():
+            _reconnect["last_error"] = "Reconnected, but the account is not authorized"
+            return False
+
+        return True
+    except Exception as e:
+        _reconnect["last_error"] = str(e)
+        logger.warning(f"Reconnect attempt failed: {e}")
+        return False
+
+
+async def _connection_watchdog(app: FastAPI) -> None:
+    """Background task keeping the Telegram connection alive.
+
+    Every 15 s (or immediately when ``_reconnect_event`` is set, e.g. by a
+    manual restart or a zombie-client detection) it checks whether the client is
+    connected. If not, it reconnects up to ``_RECONNECT_MAX_ATTEMPTS`` times;
+    after that it stops retrying and requires a manual restart via the web UI.
+    """
+    config: DaemonConfig = app.state.config
+
+    while True:
+        event = _reconnect_event
+        if event is not None:
+            try:
+                await asyncio.wait_for(event.wait(), timeout=15)
+                event.clear()
+            except asyncio.TimeoutError:
+                pass
+        else:
+            await asyncio.sleep(15)
+
+        if _reconnect["status"] == "manual_required":
+            continue
+
+        if (
+            _reconnect["status"] == "connected"
+            and _client is not None
+            and _client.is_connected()
+        ):
+            continue
+
+        if _reconnect["attempt"] >= _RECONNECT_MAX_ATTEMPTS:
+            _reconnect["status"] = "manual_required"
+            logger.error(
+                "Telegram reconnect failed after %d attempts. "
+                "Manual restart required.",
+                _RECONNECT_MAX_ATTEMPTS,
+            )
+            continue
+
+        _reconnect["status"] = "reconnecting"
+        _reconnect["attempt"] += 1
+        attempt = _reconnect["attempt"]
+        logger.warning(
+            "Telegram disconnected. Reconnect attempt %d/%d...",
+            attempt,
+            _RECONNECT_MAX_ATTEMPTS,
+        )
+
+        ok = await _attempt_reconnect(config)
+        if ok:
+            _reconnect["attempt"] = 0
+            _reconnect["status"] = "connected"
+            _reconnect["last_error"] = None
+            logger.info("Telegram reconnected successfully.")
+        else:
+            await asyncio.sleep(5 * attempt)
+
+
 @asynccontextmanager
 async def daemon_lifespan(app: FastAPI):
     """Manage daemon lifecycle - connect on startup, disconnect on shutdown."""
-    global _db_pool, _client, _session, _account_id
+    global _db_pool, _client, _session, _account_id, _watchdog_task, _reconnect_event
 
     config: DaemonConfig = app.state.config
+
+    # Capture INFO-level system logs (startup, reconnect progress, etc.) for the
+    # web UI's "last 10 minutes" view. Set after uvicorn has configured logging.
+    logging.getLogger().setLevel(logging.INFO)
 
     logger.info("Starting Telegram daemon...")
 
@@ -406,10 +587,20 @@ async def daemon_lifespan(app: FastAPI):
         # Client will be initialized during auth flow
         pass
 
+    # Start the connection watchdog (auto-reconnect, up to 3 attempts)
+    _reconnect_event = asyncio.Event()
+    _watchdog_task = asyncio.create_task(_connection_watchdog(app))
+
     yield
 
     # Cleanup
     logger.info("Shutting down Telegram daemon...")
+    if _watchdog_task:
+        _watchdog_task.cancel()
+        try:
+            await _watchdog_task
+        except (asyncio.CancelledError, Exception):
+            pass
     if _client:
         await _client.disconnect()
     if _session and hasattr(_session, "wait_for_pending_saves"):
@@ -467,27 +658,60 @@ async def logo():
 async def get_status():
     """Get daemon and auth status."""
     global _client, _account_id
-    
-    status = {
-        "connected": _client.is_connected() if _client else False,
+
+    connected = _client.is_connected() if _client else False
+    status: dict[str, Any] = {
+        "connected": connected,
         "authorized": False,
         "account_id": str(_account_id) if _account_id else None,
-        "user": None
+        "user": None,
+        "reconnect": {
+            "status": _reconnect["status"],
+            "attempt": _reconnect["attempt"],
+            "max_attempts": _RECONNECT_MAX_ATTEMPTS,
+            "last_error": _reconnect["last_error"],
+        },
     }
-    
-    if _client and _client.is_connected() and await _client.is_user_authorized():
+
+    client = _client
+    if client is None or not connected:
+        return status
+
+    # Deep check with a timeout so a zombie client never hangs the dashboard.
+    try:
+        authorized = await asyncio.wait_for(client.is_user_authorized(), timeout=5)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Telegram client unresponsive on /api/status; flagging for reconnect"
+        )
+        status["connected"] = False
+        if _reconnect["status"] == "connected":
+            _reconnect["status"] = "reconnecting"
+        if _reconnect_event is not None:
+            _reconnect_event.set()
+        status["reconnect"] = {
+            "status": _reconnect["status"],
+            "attempt": _reconnect["attempt"],
+            "max_attempts": _RECONNECT_MAX_ATTEMPTS,
+            "last_error": _reconnect["last_error"],
+        }
+        return status
+    except Exception:
+        return status
+
+    if authorized:
         status["authorized"] = True
         try:
-            me = await _client.get_me()
+            me = await asyncio.wait_for(client.get_me(), timeout=5)
             status["user"] = {
                 "id": me.id,
                 "first_name": me.first_name,
                 "username": me.username,
-                "phone": me.phone
+                "phone": me.phone,
             }
         except Exception:
             pass
-            
+
     return status
 
 
@@ -595,25 +819,36 @@ async def sign_in(req: SignInRequest):
 
 @app.post("/api/control/restart")
 async def restart_service():
-    """Restart the daemon by exiting (Docker will restart it)."""
-    logger.info("Restart requested via Web UI")
-    # Schedule exit after response
-    async def shutdown():
-        await asyncio.sleep(1)
-        os.kill(os.getpid(), signal.SIGTERM)
-        
-    asyncio.create_task(shutdown())
-    return {"message": "Restarting..."}
+    """Reconnect the Telegram service in-process.
+
+    Does NOT kill the process or reload the web page: it resets the reconnect
+    counter and wakes the connection watchdog to re-establish Telegram now.
+    """
+    logger.info("Manual reconnect requested via Web UI")
+    _reconnect["attempt"] = 0
+    _reconnect["status"] = "reconnecting"
+    if _reconnect_event is not None:
+        _reconnect_event.set()
+    return {"success": True, "message": "Reconnecting"}
 
 
 # Original Telegram API Endpoints
 @app.get("/health")
 async def health():
     """Health check endpoint."""
+    connected = _client.is_connected() if _client else False
+    authorized = False
+    if _client and connected:
+        try:
+            authorized = await asyncio.wait_for(
+                _client.is_user_authorized(), timeout=5
+            )
+        except (asyncio.TimeoutError, Exception):
+            authorized = False
     return {
         "status": "ok",
-        "connected": _client.is_connected() if _client else False,
-        "authorized": await _client.is_user_authorized() if _client else False,
+        "connected": connected,
+        "authorized": authorized,
     }
 
 
@@ -622,9 +857,15 @@ async def log_stream(request: Request):
     """SSE endpoint for streaming logs to the web UI."""
     queue: asyncio.Queue = asyncio.Queue()
 
-    # Send last N history entries first
+    # Replay history from the last 10 minutes first
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
     for entry in _log_history:
-        await queue.put(entry)
+        try:
+            t = datetime.fromisoformat(json.loads(entry)["time"])
+        except Exception:
+            t = None
+        if t is None or t >= cutoff:
+            await queue.put(entry)
 
     _log_subscribers.append(queue)
 
@@ -729,43 +970,95 @@ async def delete_messages(
 async def get_messages(
     req: GetMessagesRequest, client: TelegramClient = Depends(get_client)
 ):
-    """Get messages from an entity."""
+    """Get messages from an entity, bounded by the date window, with a cursor."""
     try:
         entity = parse_entity(req.entity)
 
-        # Parse dates if provided
-        from datetime import datetime
-        start_date = datetime.fromisoformat(req.start_date) if req.start_date else None
         end_date = datetime.fromisoformat(req.end_date) if req.end_date else None
+        if end_date is not None and end_date.tzinfo is None:
+            end_date = end_date.replace(tzinfo=timezone.utc)
 
-        messages = await client.get_messages(
-            entity,
-            limit=req.limit,
-            offset_id=req.offset_id,
-            reverse=req.reverse,
-            offset_date=end_date,
+        if req.start_date:
+            start_date = datetime.fromisoformat(req.start_date)
+            if start_date.tzinfo is None:
+                start_date = start_date.replace(tzinfo=timezone.utc)
+        else:
+            start_date = (end_date or datetime.now(timezone.utc)) - timedelta(days=10000)
+
+        messages, has_more, next_offset_id = await _fetch_message_window(
+            client, entity, req.limit, start_date, end_date, req.offset_id or None, req.reverse
         )
 
-        result = []
-        if messages:
-            for msg in messages:
-                media_info = _serialize_media(getattr(msg, "media", None))
-                result.append(
-                    {
-                        "id": msg.id,
-                        "text": msg.text,
-                        "date": msg.date.isoformat() if msg.date else None,
-                        "from_id": msg.sender_id,
-                        "out": msg.out,
-                        "has_media": media_info is not None,
-                        "media": media_info,
-                    }
-                )
-
-        return {"messages": result}
+        return {
+            "messages": messages,
+            "next_offset_id": next_offset_id,
+            "has_more": has_more,
+        }
     except Exception as e:
         logger.error(f"Error getting messages: {e}")
         raise _handle_telethon_error(e, "получение сообщений")
+
+
+@app.post("/export_messages")
+async def export_messages(
+    req: ExportMessagesRequest, client: TelegramClient = Depends(get_client)
+):
+    """Collect messages across chats for a date window (bounded, single pass)."""
+    try:
+        end_date = (
+            datetime.fromisoformat(req.end_date)
+            if req.end_date
+            else datetime.now(timezone.utc)
+        )
+        if end_date.tzinfo is None:
+            end_date = end_date.replace(tzinfo=timezone.utc)
+        start_date = datetime.fromisoformat(req.start_date)
+        if start_date.tzinfo is None:
+            start_date = start_date.replace(tzinfo=timezone.utc)
+
+        per_chat_limit = max(1, min(req.per_chat_limit, 500))
+        max_chats = max(1, min(req.max_chats, 100))
+
+        # Resolve full entities (User/Chat/Channel) so Dialog.from_entity works.
+        resolved: list[Any] = []
+        if req.entities is None:
+            async for dialog in client.iter_dialogs(limit=max_chats):  # type: ignore
+                entity = getattr(dialog, "entity", None)
+                if entity is not None:
+                    resolved.append(entity)
+        else:
+            for e in req.entities:
+                try:
+                    resolved.append(await client.get_entity(parse_entity(e)))  # type: ignore
+                except Exception as ex:
+                    logger.warning(f"export: could not resolve entity {e}: {ex}")
+
+        results = []
+        truncated = False
+        for entity in resolved:
+            try:
+                msgs, _, _ = await _fetch_message_window(
+                    client, entity, per_chat_limit, start_date, end_date, None
+                )
+                if len(msgs) >= per_chat_limit:
+                    truncated = True
+                results.append(
+                    {
+                        "dialog": Dialog.from_entity(entity).model_dump(mode="json"),  # type: ignore
+                        "messages": msgs,
+                    }
+                )
+            except Exception as ex:
+                logger.warning(f"export: failed for entity {entity}: {ex}")
+
+        return {
+            "results": results,
+            "chats_processed": len(results),
+            "truncated": truncated,
+        }
+    except Exception as e:
+        logger.error(f"Error exporting messages: {e}")
+        raise _handle_telethon_error(e, "экспорт сообщений")
 
 
 # Search
