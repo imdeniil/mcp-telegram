@@ -9,13 +9,16 @@ from typing import Any
 
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings
-from telethon import TelegramClient, hints, types  # type: ignore
+from telethon import TelegramClient, hints, types, utils  # type: ignore
 from telethon.tl import custom, functions, patched  # type: ignore
 from xdg_base_dirs import xdg_state_home
 
 from mcp_telegram.types import (
+    ChatMessages,
     Dialog,
     DownloadedMedia,
+    ExportResult,
+    Folder,
     Media,
     Message,
     Messages,
@@ -190,6 +193,7 @@ class Telegram:
         end_date: datetime | None = None,
         unread: bool = False,
         mark_as_read: bool = False,
+        offset_id: int | None = None,
     ) -> Messages:
         """Get messages from a specific entity.
 
@@ -206,10 +210,16 @@ class Telegram:
                 Whether to get only unread messages. Defaults to False.
             mark_as_read (`bool`, optional):
                 Whether to mark the messages as read. Defaults to False.
+            offset_id (`int`, optional):
+                Pagination cursor: fetch messages older than this message ID.
+                Use the `next_offset_id` returned by a previous call to page
+                through a large date range. Defaults to None (start from the
+                newest / `end_date`).
 
         Returns:
-            `list[Message]`:
-                A list of messages from the specific entity, ordered newest to oldest.
+            `Messages`:
+                A page of messages ordered newest to oldest, plus `next_offset_id`
+                and `has_more` for pagination.
         """
 
         if end_date is None:
@@ -235,10 +245,11 @@ class Telegram:
             limit = min(limit, dialog.unread_messages_count)
 
         results: list[Message] = []
-        async for message in self.client.iter_messages(  # type: ignore
-            _entity,
-            offset_date=end_date,  # fetching messages older than end_date
-        ):
+        hit_boundary = False
+        iter_kwargs: dict[str, Any] = {"offset_date": end_date}
+        if offset_id:
+            iter_kwargs["offset_id"] = offset_id
+        async for message in self.client.iter_messages(_entity, **iter_kwargs):  # type: ignore
             # Skip service messages and empty messages immediately
             if not isinstance(message, patched.Message) or isinstance(
                 message, patched.MessageService | patched.MessageEmpty
@@ -248,8 +259,12 @@ class Telegram:
             if message.date is None:
                 continue
 
-            if message.date < start_date or len(results) >= limit:
+            if message.date < start_date:
+                hit_boundary = True
                 break
+
+            if len(results) >= limit:
+                break  # page full; more may remain in the window
 
             if mark_as_read:
                 try:
@@ -259,7 +274,96 @@ class Telegram:
 
             results.append(Message.from_message(message))
 
-        return Messages(messages=results, dialog=dialog)
+        has_more = (not hit_boundary) and len(results) >= limit
+        next_offset_id = results[-1].message_id if (results and has_more) else None
+
+        return Messages(
+            messages=results,
+            dialog=dialog,
+            next_offset_id=next_offset_id,
+            has_more=has_more,
+        )
+
+    async def export_messages(
+        self,
+        entities: list[str | int] | None = None,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+        per_chat_limit: int = 100,
+        max_chats: int = 30,
+    ) -> ExportResult:
+        """Collect messages across multiple chats for a date window.
+
+        When `entities` is None, the account's most recent dialogs (up to
+        `max_chats`) are used. The result is bounded by `per_chat_limit` per
+        chat; page individual chats further via `get_messages(offset_id=...)`.
+
+        Args:
+            entities (`list[str | int] | None`, optional): Chats to export. If
+                None, recent dialogs (up to `max_chats`) are exported.
+            start_date (`datetime`): Start of the export window. Required.
+            end_date (`datetime`, optional): End of the window. Defaults to now.
+            per_chat_limit (`int`, optional): Max messages per chat. Defaults to
+                100, clamped to [1, 500].
+            max_chats (`int`, optional): Max chats when `entities` is None.
+                Defaults to 30, clamped to [1, 100].
+
+        Returns:
+            `ExportResult`: Per-chat message batches with truncation flag.
+
+        Raises:
+            `ValueError`: If `start_date` is not provided.
+        """
+        if start_date is None:
+            raise ValueError("start_date is required for export")
+
+        if end_date is None:
+            end_date = datetime.now(timezone.utc)
+        if start_date.tzinfo is None:
+            start_date = start_date.replace(tzinfo=timezone.utc)
+        if end_date.tzinfo is None:
+            end_date = end_date.replace(tzinfo=timezone.utc)
+
+        per_chat_limit = max(1, min(per_chat_limit, 500))
+        max_chats = max(1, min(max_chats, 100))
+
+        # Resolve the list of entities to export.
+        resolved: list[hints.Entity] = []
+        if entities is None:
+            async for dialog in self.client.iter_dialogs(limit=max_chats):  # type: ignore
+                entity = dialog.entity  # type: ignore
+                if entity is not None and isinstance(entity, hints.Entity):
+                    resolved.append(entity)
+        else:
+            for entity in entities:
+                try:
+                    resolved.append(await self.client.get_entity(entity))  # type: ignore
+                except Exception as e:
+                    logger.warning(f"export: could not resolve entity {entity}: {e}")
+
+        results: list[ChatMessages] = []
+        truncated = False
+        for entity in resolved:
+            try:
+                peer_id = utils.get_peer_id(entity)  # type: ignore
+                page = await self.get_messages(
+                    peer_id,  # type: ignore
+                    limit=per_chat_limit,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+                dialog = page.dialog if page.dialog is not None else Dialog.from_entity(entity)
+                if len(page.messages) >= per_chat_limit:
+                    truncated = True
+                results.append(ChatMessages(dialog=dialog, messages=page.messages))
+            except Exception as e:
+                logger.warning(f"export: failed for entity {entity}: {e}")
+
+        return ExportResult(
+            results=results,
+            chats_processed=len(results),
+            truncated=truncated,
+        )
 
     async def download_media(
         self, entity: str | int, message_id: int, path: str | None = None
@@ -461,3 +565,327 @@ class Telegram:
         result.sort(key=lambda x: priority.get(x.id))  # type: ignore
 
         return result
+
+    async def get_folders(self) -> list[Folder]:
+        """Get all chat folders (dialog filters) of the logged-in account.
+
+        Returns:
+            `list[Folder]`: The list of folders, including the default
+                'All Chats' folder if the server reports one.
+        """
+        response: Any = await self.client(  # type: ignore
+            functions.messages.GetDialogFiltersRequest()
+        )
+        assert isinstance(response, types.messages.DialogFilters)
+        return [Folder.from_filter(f) for f in response.filters]
+
+    async def get_folder_dialogs(
+        self, folder_id: int, limit: int = 100
+    ) -> list[Dialog]:
+        """Get the dialogs (chats) belonging to a specific folder.
+
+        Args:
+            folder_id (`int`): The folder ID (use `get_folders` to find it).
+                `0` lists all non-archived chats, `1` lists archived chats.
+            limit (`int`, optional): Maximum number of dialogs to return.
+                Defaults to 100.
+
+        Returns:
+            `list[Dialog]`: The dialogs contained in the folder.
+
+        Raises:
+            `ValueError`: If `limit` is not greater than 0.
+        """
+        if limit <= 0:
+            raise ValueError("Limit must be greater than 0!")
+
+        result: list[Dialog] = []
+        async for dialog in self.client.iter_dialogs(  # type: ignore
+            folder=folder_id, limit=limit
+        ):
+            entity = dialog.entity  # type: ignore
+            if entity is None:
+                continue
+            try:
+                built = Dialog.from_entity(entity)  # type: ignore
+                built.unread_messages_count = dialog.unread_count or 0  # type: ignore
+                result.append(built)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to build dialog for folder {folder_id}: {e}"
+                )
+
+        return result
+
+    async def create_folder(
+        self,
+        title: str,
+        emoticon: str | None = None,
+        include_entities: list[str | int] | None = None,
+        exclude_entities: list[str | int] | None = None,
+        contacts: bool = False,
+        non_contacts: bool = False,
+        groups: bool = False,
+        broadcasts: bool = False,
+        bots: bool = False,
+        exclude_muted: bool = False,
+        exclude_read: bool = False,
+        exclude_archived: bool = False,
+    ) -> Folder:
+        """Create a new chat folder.
+
+        Args:
+            title (`str`): The title of the folder.
+            emoticon (`str`, optional): An emoji icon for the folder.
+            include_entities (`list[str | int]`, optional): Entities (chat IDs,
+                usernames, phone numbers) to explicitly include.
+            exclude_entities (`list[str | int]`, optional): Entities to explicitly
+                exclude.
+            contacts (`bool`, optional): Auto-include contacts.
+            non_contacts (`bool`, optional): Auto-include non-contacts.
+            groups (`bool`, optional): Auto-include groups.
+            broadcasts (`bool`, optional): Auto-include channels.
+            bots (`bool`, optional): Auto-include bots.
+            exclude_muted (`bool`, optional): Exclude muted chats.
+            exclude_read (`bool`, optional): Exclude read chats.
+            exclude_archived (`bool`, optional): Exclude archived chats.
+
+        Returns:
+            `Folder`: The created folder.
+
+        Raises:
+            `ValueError`: If the title is empty, or if any provided entity
+                cannot be resolved (no changes are made in that case).
+        """
+        if not title:
+            raise ValueError("Folder title cannot be empty!")
+
+        folder_id = await self._next_folder_id()
+        include_peers = await self._resolve_input_peers(include_entities)
+        exclude_peers = await self._resolve_input_peers(exclude_entities)
+
+        dialog_filter = types.DialogFilter(
+            id=folder_id,
+            title=types.TextWithEntities(text=title, entities=[]),
+            emoticon=emoticon,
+            pinned_peers=[],
+            include_peers=include_peers,
+            exclude_peers=exclude_peers,
+            contacts=contacts or None,
+            non_contacts=non_contacts or None,
+            groups=groups or None,
+            broadcasts=broadcasts or None,
+            bots=bots or None,
+            exclude_muted=exclude_muted or None,
+            exclude_read=exclude_read or None,
+            exclude_archived=exclude_archived or None,
+        )
+        try:
+            await self.client(
+                functions.messages.UpdateDialogFilterRequest(
+                    id=folder_id, filter=dialog_filter
+                )
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to create folder {title!r} (id={folder_id}): {e}",
+                exc_info=True,
+            )
+            raise e
+
+        return Folder.from_filter(dialog_filter)
+
+    async def update_folder(
+        self,
+        folder_id: int,
+        title: str | None = None,
+        emoticon: str | None = None,
+        add_entities: list[str | int] | None = None,
+        remove_entities: list[str | int] | None = None,
+    ) -> Folder:
+        """Update an existing chat folder.
+
+        Telegram requires the whole folder to be resent, so the current folder
+        is fetched first and only the requested fields are modified.
+
+        Args:
+            folder_id (`int`): The ID of the folder to update.
+            title (`str`, optional): A new title for the folder.
+            emoticon (`str`, optional): A new emoji icon. Pass an empty string to
+                clear the current icon.
+            add_entities (`list[str | int]`, optional): Entities to add to the
+                folder.
+            remove_entities (`list[str | int]`, optional): Entities to remove
+                from the folder.
+
+        Returns:
+            `Folder`: The updated folder.
+
+        Raises:
+            `ValueError`: If the folder does not exist or is not editable.
+        """
+        target = await self._get_raw_filter(folder_id)
+        if target is None:
+            raise ValueError(
+                f"Folder {folder_id} not found or is not editable "
+                "(the default 'All Chats' and shareable folders cannot be updated)."
+            )
+
+        new_title = target.title
+        if title is not None:
+            new_title = types.TextWithEntities(text=title, entities=[])
+
+        new_emoticon = target.emoticon
+        if emoticon is not None:
+            new_emoticon = emoticon or None
+
+        include_peers: list[Any] = list(target.include_peers or [])
+        if add_entities:
+            include_peers.extend(await self._resolve_input_peers(add_entities))
+        if remove_entities:
+            remove_ids: set[int] = {
+                int(utils.get_peer_id(p))  # type: ignore
+                for p in await self._resolve_input_peers(remove_entities)
+            }
+            include_peers = [
+                p
+                for p in include_peers
+                if int(utils.get_peer_id(p)) not in remove_ids  # type: ignore
+            ]
+
+        dialog_filter = types.DialogFilter(
+            id=target.id,
+            title=new_title,
+            emoticon=new_emoticon,
+            pinned_peers=list(target.pinned_peers or []),
+            include_peers=include_peers,
+            exclude_peers=list(target.exclude_peers or []),
+            contacts=target.contacts,
+            non_contacts=target.non_contacts,
+            groups=target.groups,
+            broadcasts=target.broadcasts,
+            bots=target.bots,
+            exclude_muted=target.exclude_muted,
+            exclude_read=target.exclude_read,
+            exclude_archived=target.exclude_archived,
+        )
+        await self.client(
+            functions.messages.UpdateDialogFilterRequest(
+                id=folder_id, filter=dialog_filter
+            )
+        )
+        return Folder.from_filter(dialog_filter)
+
+    async def delete_folder(self, folder_id: int) -> None:
+        """Delete a chat folder by its ID.
+
+        Chats inside the folder are not deleted; they simply no longer belong
+        to the folder.
+
+        Args:
+            folder_id (`int`): The ID of the folder to delete. Must be a user
+                folder (ID >= 2); system folders ('All Chats', archive) cannot
+                be deleted.
+
+        Raises:
+            `ValueError`: If `folder_id` refers to a system folder (< 2).
+        """
+        if folder_id < 2:
+            raise ValueError(
+                f"Cannot delete folder {folder_id}: only user folders "
+                "(IDs >= 2) can be deleted."
+            )
+
+        await self.client(
+            functions.messages.UpdateDialogFilterRequest(
+                id=folder_id, filter=None
+            )
+        )
+
+    async def reorder_folders(self, folder_ids: list[int]) -> None:
+        """Reorder chat folders.
+
+        Args:
+            folder_ids (`list[int]`): The desired order of folder IDs. Should
+                contain all user folder IDs (the server ignores unknown IDs).
+
+        Raises:
+            `ValueError`: If `folder_ids` is empty.
+        """
+        if not folder_ids:
+            raise ValueError("folder_ids cannot be empty!")
+
+        await self.client(
+            functions.messages.UpdateDialogFiltersOrderRequest(
+                order=list(folder_ids)
+            )
+        )
+
+    async def _resolve_input_peers(
+        self, entities: list[str | int] | None
+    ) -> list[Any]:
+        """Resolve a list of entity identifiers into `InputPeer` objects.
+
+        Unresolvable entities are skipped with a warning.
+
+        Args:
+            entities (`list[str | int] | None`): The entities to resolve.
+
+        Returns:
+            `list[Any]`: The resolved `InputPeer` objects.
+        """
+        if not entities:
+            return []
+
+        peers: list[Any] = []
+        failed: list[str] = []
+        for entity in entities:
+            try:
+                peers.append(await self.client.get_input_entity(entity))  # type: ignore
+            except Exception as e:
+                logger.warning(f"Failed to resolve entity {entity}: {e}")
+                failed.append(str(entity))
+
+        if failed:
+            raise ValueError(
+                f"Could not resolve {len(failed)} entity/entities: {failed}. "
+                "No changes were made; fix or remove them and retry."
+            )
+
+        return peers
+
+    async def _next_folder_id(self) -> int:
+        """Find the next free folder ID (>= 2) for a new user folder."""
+        response: Any = await self.client(  # type: ignore
+            functions.messages.GetDialogFiltersRequest()
+        )
+        assert isinstance(response, types.messages.DialogFilters)
+
+        max_id = 1
+        for f in response.filters:
+            if isinstance(f, types.DialogFilter | types.DialogFilterChatlist):
+                if f.id > max_id:
+                    max_id = f.id
+
+        return max(max_id + 1, 2)
+
+    async def _get_raw_filter(self, folder_id: int) -> Any | None:
+        """Get a raw `DialogFilter` by ID, skipping non-editable filters.
+
+        Args:
+            folder_id (`int`): The folder ID to look up.
+
+        Returns:
+            `Any | None`: The matching `DialogFilter`, or `None` if not found
+                or not editable.
+        """
+        response: Any = await self.client(  # type: ignore
+            functions.messages.GetDialogFiltersRequest()
+        )
+        assert isinstance(response, types.messages.DialogFilters)
+
+        for f in response.filters:
+            if isinstance(f, types.DialogFilter) and f.id == folder_id:
+                return f
+
+        return None

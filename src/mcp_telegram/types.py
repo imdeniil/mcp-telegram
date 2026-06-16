@@ -10,6 +10,40 @@ from telethon import hints, types, utils  # type: ignore
 from telethon.tl import custom, patched  # type: ignore
 
 
+DATE_INPUT_GUIDE = """\
+How to enter dates for date-filtered tools (get_messages, export_messages).
+
+Date parameters accept ISO 8601 strings. A timezone offset is recommended;
+values without one are interpreted as UTC.
+
+Formats:
+  - Full:      2026-06-09T18:03:54+00:00
+  - Date only: 2026-06-09            (-> 2026-06-09T00:00:00+00:00)
+  - Date+time: 2026-06-09T18:03:54   (naive -> treated as UTC)
+
+Common windows (use the current date when computing these):
+  - Last week:      start_date = <now minus 7 days>
+  - Last 30 days:   start_date = <now minus 30 days>
+  - A specific day: start_date = 2026-06-09T00:00:00+00:00
+                    end_date   = 2026-06-09T23:59:59+00:00
+  - From a date to now: set only start_date (end_date defaults to now).
+
+Tools:
+  - get_messages(entity, start_date, end_date, limit, offset_id):
+      one chat, one page. Pass the returned next_offset_id as offset_id on the
+      next call to fetch the following page; stop when has_more is false.
+  - export_messages(entities, start_date, end_date?, per_chat_limit, max_chats):
+      collect messages across chats. start_date is required (bounds the work).
+      Leave entities unset to export the most recent chats (up to max_chats).
+
+Tips:
+  - Always provide start_date for exports (required) and to bound large fetches.
+  - For big ranges, page with limit + offset_id instead of one giant limit.
+  - Relative phrasing like "last week" means compute the absolute ISO date from
+    the current time, then pass it.
+"""
+
+
 class DialogType(Enum):
     """The type of a dialog."""
 
@@ -76,6 +110,94 @@ class Dialog(BaseModel):
             phone_number=phone_number,
             unread_messages_count=0,
             can_send_message=can_send_message,
+        )
+
+
+class Folder(BaseModel):
+    """A Telegram chat folder (dialog filter)."""
+
+    id: int
+    """The ID of the folder. User folders have IDs >= 2; 0 = all chats, 1 = archive."""
+    title: str
+    """The title of the folder."""
+    emoticon: str | None = None
+    """The emoji icon of the folder, if any."""
+    contacts: bool = False
+    """Whether the folder includes contacts."""
+    non_contacts: bool = False
+    """Whether the folder includes non-contacts."""
+    groups: bool = False
+    """Whether the folder includes groups."""
+    broadcasts: bool = False
+    """Whether the folder includes channels (broadcasts)."""
+    bots: bool = False
+    """Whether the folder includes bots."""
+    exclude_muted: bool = False
+    """Whether muted chats are excluded from the folder."""
+    exclude_read: bool = False
+    """Whether read chats are excluded from the folder."""
+    exclude_archived: bool = False
+    """Whether archived chats are excluded from the folder."""
+    include_peer_ids: list[int] = []
+    """Peer IDs explicitly included in the folder."""
+    exclude_peer_ids: list[int] = []
+    """Peer IDs explicitly excluded from the folder."""
+    pinned_peer_ids: list[int] = []
+    """Peer IDs pinned within the folder."""
+    is_chatlist: bool = False
+    """Whether this is a shareable folder (chatlist)."""
+    is_default: bool = False
+    """Whether this is the default 'All Chats' folder (not editable)."""
+
+    @staticmethod
+    def from_filter(filter: typing.Any) -> "Folder":
+        """Convert a `telethon` dialog filter object to a `Folder` object.
+
+        Args:
+            filter (`typing.Any`): A telethon dialog filter, i.e. an instance of
+                `DialogFilter`, `DialogFilterChatlist`, or `DialogFilterDefault`.
+
+        Returns:
+            `Folder`: The converted Folder object.
+        """
+        if isinstance(filter, types.DialogFilterDefault):
+            return Folder(id=0, title="All Chats", is_default=True)
+
+        is_chatlist = isinstance(filter, types.DialogFilterChatlist)
+
+        title_text = ""
+        if filter.title is not None:
+            raw_title = filter.title.text
+            title_text = raw_title if isinstance(raw_title, str) else str(raw_title)
+
+        def _peer_ids(peers: typing.Any) -> list[int]:
+            return [int(utils.get_peer_id(p)) for p in (peers or [])]  # type: ignore
+
+        include_peer_ids = _peer_ids(filter.include_peers)
+        pinned_peer_ids = _peer_ids(filter.pinned_peers)
+        exclude_peer_ids = (
+            _peer_ids(filter.exclude_peers) if not is_chatlist else []
+        )
+
+        emoticon = filter.emoticon if isinstance(filter.emoticon, str) else None
+
+        return Folder(
+            id=int(filter.id),
+            title=title_text,
+            emoticon=emoticon,
+            contacts=bool(getattr(filter, "contacts", None) or False),
+            non_contacts=bool(getattr(filter, "non_contacts", None) or False),
+            groups=bool(getattr(filter, "groups", None) or False),
+            broadcasts=bool(getattr(filter, "broadcasts", None) or False),
+            bots=bool(getattr(filter, "bots", None) or False),
+            exclude_muted=bool(getattr(filter, "exclude_muted", None) or False),
+            exclude_read=bool(getattr(filter, "exclude_read", None) or False),
+            exclude_archived=bool(getattr(filter, "exclude_archived", None) or False),
+            include_peer_ids=include_peer_ids,
+            exclude_peer_ids=exclude_peer_ids,
+            pinned_peer_ids=pinned_peer_ids,
+            is_chatlist=is_chatlist,
+            is_default=False,
         )
 
 
@@ -200,3 +322,31 @@ class Messages(BaseModel):
     """The list of messages."""
     dialog: Dialog | None = None
     """The dialog the messages belong to."""
+    next_offset_id: int | None = None
+    """Cursor for pagination: the oldest message ID in this page. Pass it as
+    `offset_id` on the next `get_messages` call to fetch the following page.
+    `None` when there are no older messages in the requested range."""
+    has_more: bool = False
+    """Whether more messages may remain in the requested range (page stopped at
+    `limit`, not at the date boundary)."""
+
+
+class ChatMessages(BaseModel):
+    """Messages from a single chat, part of a cross-chat export."""
+
+    dialog: Dialog
+    """The dialog the messages belong to."""
+    messages: list[Message]
+    """The messages collected from this chat for the export window."""
+
+
+class ExportResult(BaseModel):
+    """Result of a cross-chat message export over a date window."""
+
+    results: list[ChatMessages]
+    """Per-chat message batches, one entry per processed chat."""
+    chats_processed: int
+    """Number of chats included in this export."""
+    truncated: bool
+    """True if at least one chat hit `per_chat_limit` (more messages may exist
+    in the window for that chat; page it via `get_messages(offset_id=...)`)."""
