@@ -786,7 +786,7 @@ async def resend_code(req: ResendCodeRequest):
         raise HTTPException(status_code=400, detail="Auth not started")
     try:
         result = await _client(
-            functions.messages.ResendCodeRequest(
+            functions.auth.ResendCodeRequest(
                 phone=req.phone, phone_code_hash=req.phone_code_hash
             )
         )
