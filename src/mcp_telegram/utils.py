@@ -8,20 +8,22 @@ from pathlib import Path
 from telethon.tl import patched  # type: ignore
 
 
-def parse_entity(entity: str) -> int | str:
+def parse_entity(entity: str | int) -> int | str:
     """
-    Parse a string entity identifier as an integer ID.
+    Parse an entity identifier as an integer ID.
 
-    If the string represents a valid integer (potentially negative), it's
-    returned as an `int`. Otherwise, the original string (assumed to be
-    a username or phone number) is returned.
+    If it's already an int, it's returned unchanged. If the string represents
+    a valid integer (potentially negative), it's returned as an `int`.
+    Otherwise the original string (a username or phone number) is returned.
 
     Args:
-        entity (`str`): The entity (ID, username, phone number, or "me").
+        entity (`str | int`): The entity (ID, username, phone number, or "me").
 
     Returns:
         `int | str`: The parsed integer ID or the original string identifier.
     """
+    if isinstance(entity, int):
+        return entity
     return int(entity) if entity.lstrip("-").isdigit() else entity
 
 
